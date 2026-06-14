@@ -1,0 +1,15 @@
+[package]
+name = "tessera-server"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+tessera-core = { path = "../tessera-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+
+[dev-dependencies]
+tower = { workspace = true }
