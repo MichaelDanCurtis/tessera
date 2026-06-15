@@ -1,8 +1,3 @@
-mod app;
-mod config;
-mod routes_kv;
-mod routes_sys;
-
 use std::sync::Arc;
 
 use tessera_core::audit::InMemoryAudit;
@@ -10,8 +5,8 @@ use tessera_core::auth::TokenStore;
 use tessera_core::engine::InMemoryEngine;
 use tessera_core::kv::KvStore;
 use tessera_core::seal::SealState;
-
-use crate::app::{router, AppState};
+use tessera_server::app::{router, AppState};
+use tessera_server::config;
 
 #[tokio::main]
 async fn main() {
@@ -24,8 +19,6 @@ async fn main() {
     };
     eprintln!("tessera: crypto backend = {}", cfg.crypto_backend);
 
-    // V1 boots with InMemoryEngine unsealed by the configured master key.
-    // Swapping RustyVaultEngine (Task 9) is a one-line change once the spike lands.
     let seal = SealState::new(cfg.master_key.clone());
     seal.unseal(&cfg.master_key)
         .expect("master key unseals own vault");
