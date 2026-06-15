@@ -61,8 +61,18 @@ mod tests {
     #[test]
     fn append_is_ordered_and_readable() {
         let a = InMemoryAudit::new();
-        a.append(AuditRecord { op: AuditOp::Write, scope: "secret/galvo/openai".into(), token_hash: token_hash("t"), outcome: true });
-        a.append(AuditRecord { op: AuditOp::Read, scope: "secret/galvo/openai".into(), token_hash: token_hash("t"), outcome: true });
+        a.append(AuditRecord {
+            op: AuditOp::Write,
+            scope: "secret/galvo/openai".into(),
+            token_hash: token_hash("t"),
+            outcome: true,
+        });
+        a.append(AuditRecord {
+            op: AuditOp::Read,
+            scope: "secret/galvo/openai".into(),
+            token_hash: token_hash("t"),
+            outcome: true,
+        });
         let recs = a.records();
         assert_eq!(recs.len(), 2);
         assert_eq!(recs[0].op, AuditOp::Write);

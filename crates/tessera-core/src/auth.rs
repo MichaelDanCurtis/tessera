@@ -11,13 +11,17 @@ pub struct Policy {
 
 impl Policy {
     pub fn new(prefixes: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        Self { allow_prefixes: prefixes.into_iter().map(Into::into).collect() }
+        Self {
+            allow_prefixes: prefixes.into_iter().map(Into::into).collect(),
+        }
     }
 
     /// True iff `path`'s scope starts with any allowed prefix.
     pub fn allows(&self, path: &SecretPath) -> bool {
         let scope = path.scope();
-        self.allow_prefixes.iter().any(|p| scope.starts_with(p.as_str()))
+        self.allow_prefixes
+            .iter()
+            .any(|p| scope.starts_with(p.as_str()))
     }
 }
 
@@ -30,7 +34,9 @@ pub struct TokenStore {
 
 impl TokenStore {
     pub fn new() -> Self {
-        Self { tokens: HashMap::new() }
+        Self {
+            tokens: HashMap::new(),
+        }
     }
 
     pub fn insert(&mut self, token: impl Into<String>, policy: Policy) {
@@ -62,12 +68,16 @@ mod tests {
 
     #[test]
     fn in_scope_path_authorized() {
-        store().authorize("galvo-tok", &SecretPath::new("secret", "galvo/openai")).unwrap();
+        store()
+            .authorize("galvo-tok", &SecretPath::new("secret", "galvo/openai"))
+            .unwrap();
     }
 
     #[test]
     fn out_of_scope_path_forbidden() {
-        let err = store().authorize("galvo-tok", &SecretPath::new("secret", "femto/key")).unwrap_err();
+        let err = store()
+            .authorize("galvo-tok", &SecretPath::new("secret", "femto/key"))
+            .unwrap_err();
         assert_eq!(err, TesseraError::Forbidden("secret/femto/key".into()));
     }
 
@@ -81,7 +91,9 @@ mod tests {
 
     #[test]
     fn empty_policy_denies_everything() {
-        let err = store().authorize("empty-tok", &SecretPath::new("secret", "galvo/openai")).unwrap_err();
+        let err = store()
+            .authorize("empty-tok", &SecretPath::new("secret", "galvo/openai"))
+            .unwrap_err();
         assert!(matches!(err, TesseraError::Forbidden(_)));
     }
 }

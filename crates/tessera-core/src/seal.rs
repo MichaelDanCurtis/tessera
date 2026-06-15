@@ -12,7 +12,10 @@ pub struct SealState {
 impl SealState {
     /// Construct sealed, holding the configured master key.
     pub fn new(master_key: Vec<u8>) -> Self {
-        Self { sealed: AtomicBool::new(true), master_key }
+        Self {
+            sealed: AtomicBool::new(true),
+            master_key,
+        }
     }
 
     pub fn is_sealed(&self) -> bool {
@@ -35,7 +38,11 @@ impl SealState {
 
     /// Guard helper: `Err(Sealed)` when sealed, else `Ok(())`.
     pub fn require_unsealed(&self) -> Result<(), TesseraError> {
-        if self.is_sealed() { Err(TesseraError::Sealed) } else { Ok(()) }
+        if self.is_sealed() {
+            Err(TesseraError::Sealed)
+        } else {
+            Ok(())
+        }
     }
 }
 

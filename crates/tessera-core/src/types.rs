@@ -11,7 +11,10 @@ pub struct SecretPath {
 
 impl SecretPath {
     pub fn new(mount: impl Into<String>, path: impl Into<String>) -> Self {
-        Self { mount: mount.into(), path: path.into() }
+        Self {
+            mount: mount.into(),
+            path: path.into(),
+        }
     }
     /// Canonical scope string used by policies + audit, e.g. `secret/galvo/openai`.
     pub fn scope(&self) -> String {

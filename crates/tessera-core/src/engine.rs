@@ -23,7 +23,10 @@ pub struct InMemoryEngine {
 
 impl InMemoryEngine {
     pub fn new(created_time: impl Into<String>) -> Self {
-        Self { store: Mutex::new(BTreeMap::new()), created_time: created_time.into() }
+        Self {
+            store: Mutex::new(BTreeMap::new()),
+            created_time: created_time.into(),
+        }
     }
 }
 
@@ -34,11 +37,25 @@ impl SecretEngine for InMemoryEngine {
     }
     fn get(&self, path: &SecretPath) -> Result<(SecretValue, SecretMetadata), TesseraError> {
         let store = self.store.lock().unwrap();
-        let value = store.get(&path.scope()).cloned().ok_or(TesseraError::NotFound)?;
-        Ok((value, SecretMetadata { current_version: 1, created_time: self.created_time.clone() }))
+        let value = store
+            .get(&path.scope())
+            .cloned()
+            .ok_or(TesseraError::NotFound)?;
+        Ok((
+            value,
+            SecretMetadata {
+                current_version: 1,
+                created_time: self.created_time.clone(),
+            },
+        ))
     }
     fn delete(&self, path: &SecretPath) -> Result<(), TesseraError> {
-        self.store.lock().unwrap().remove(&path.scope()).map(|_| ()).ok_or(TesseraError::NotFound)
+        self.store
+            .lock()
+            .unwrap()
+            .remove(&path.scope())
+            .map(|_| ())
+            .ok_or(TesseraError::NotFound)
     }
     fn list(&self, prefix: &SecretPath) -> Result<Vec<String>, TesseraError> {
         let scope_prefix = if prefix.path.is_empty() {
@@ -86,15 +103,21 @@ mod tests {
     #[test]
     fn get_missing_is_not_found() {
         let eng = InMemoryEngine::new("t");
-        assert_eq!(eng.get(&SecretPath::new("secret", "nope")), Err(TesseraError::NotFound));
+        assert_eq!(
+            eng.get(&SecretPath::new("secret", "nope")),
+            Err(TesseraError::NotFound)
+        );
     }
 
     #[test]
     fn list_returns_immediate_names_under_prefix() {
         let eng = InMemoryEngine::new("t");
-        eng.put(&SecretPath::new("secret", "galvo/openai"), val("k", "1")).unwrap();
-        eng.put(&SecretPath::new("secret", "galvo/anthropic"), val("k", "2")).unwrap();
-        eng.put(&SecretPath::new("secret", "femto/key"), val("k", "3")).unwrap();
+        eng.put(&SecretPath::new("secret", "galvo/openai"), val("k", "1"))
+            .unwrap();
+        eng.put(&SecretPath::new("secret", "galvo/anthropic"), val("k", "2"))
+            .unwrap();
+        eng.put(&SecretPath::new("secret", "femto/key"), val("k", "3"))
+            .unwrap();
         let keys = eng.list(&SecretPath::new("secret", "galvo")).unwrap();
         assert_eq!(keys, vec!["anthropic".to_string(), "openai".to_string()]);
     }
