@@ -1,7 +1,8 @@
+use std::path::Path;
 use std::sync::Arc;
 
-use tessera_core::audit::InMemoryAudit;
-use tessera_core::auth::{PolicyStore, TokenStore};
+use tessera_core::audit::FileAuditSink;
+use tessera_core::auth::{Policy, PolicyStore, TokenStore};
 use tessera_core::clock::SystemClock;
 use tessera_core::rusty_engine::RustyVaultEngine;
 use tessera_core::seal::SealState;
@@ -35,12 +36,46 @@ async fn main() {
     seal.unseal(&cfg.master_key)
         .expect("master key unseals own vault");
 
+    let data = Path::new(&cfg.data_dir);
+    let audit = match FileAuditSink::open(data.join("audit.log")) {
+        Ok(a) => Arc::new(a),
+        Err(e) => {
+            eprintln!("tessera: audit open failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    let policies = match PolicyStore::open(data.join("policies.json")) {
+        Ok(p) => Arc::new(p),
+        Err(e) => {
+            eprintln!("tessera: policy store open failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    let mut tokens = match TokenStore::open(data.join("tokens.json")) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("tessera: token store open failed: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // Seed an admin policy + static admin token from env so the Galvo proxy can
+    // administer the vault out of the box. The admin token is a STATIC inline
+    // token granting sys/ (and secret/ so it can also drive the KV path on
+    // behalf of operators) — it is never persisted to tokens.json.
+    if let Some(admin) = &cfg.admin_token {
+        policies
+            .put("admin", Policy::new(["sys/", "secret/"]))
+            .expect("seed admin policy");
+        tokens.insert(admin.clone(), Policy::new(["sys/", "secret/"]));
+    }
+
     let vault = VaultStore::new(
         Arc::new(engine),
         seal,
-        TokenStore::new(),
-        Arc::new(PolicyStore::in_memory()),
-        Arc::new(InMemoryAudit::new()),
+        tokens,
+        policies,
+        audit,
         Arc::new(SystemClock),
     );
     let state = AppState {
