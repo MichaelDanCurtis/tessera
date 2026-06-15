@@ -256,6 +256,48 @@ fn store(msg: impl Into<String>) -> TesseraError {
     TesseraError::Storage(msg.into())
 }
 
+/// Encrypt the seal material with AES-256-GCM. The key is SHA-256(master_key); a
+/// random 12-byte nonce is generated and **prepended** to the ciphertext.
+/// Output layout: `nonce(12) || ciphertext+tag`.
+fn seal_encrypt(master_key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, TesseraError> {
+    use aes_gcm::aead::{Aead, KeyInit, OsRng};
+    use aes_gcm::{AeadCore, Aes256Gcm, Key};
+    use sha2::{Digest, Sha256};
+
+    let key_bytes = Sha256::digest(master_key);
+    let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
+    let cipher = Aes256Gcm::new(key);
+    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let ct = cipher
+        .encrypt(&nonce, plaintext)
+        .map_err(|e| store(format!("seal encrypt: {e}")))?;
+    let mut out = Vec::with_capacity(12 + ct.len());
+    out.extend_from_slice(nonce.as_slice());
+    out.extend_from_slice(&ct);
+    Ok(out)
+}
+
+/// Inverse of [`seal_encrypt`]. Splits the prepended 12-byte nonce, then decrypts.
+fn seal_decrypt(master_key: &[u8], blob: &[u8]) -> Result<Vec<u8>, TesseraError> {
+    use aes_gcm::aead::{Aead, KeyInit};
+    use aes_gcm::{AeadCore, Aes256Gcm, Key, Nonce};
+    use sha2::{Digest, Sha256};
+
+    if blob.len() < 12 {
+        return Err(store("seal blob too short"));
+    }
+    let (nonce_bytes, ct) = blob.split_at(12);
+    let key_bytes = Sha256::digest(master_key);
+    let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
+    let cipher = Aes256Gcm::new(key);
+    // `Nonce` is parameterized by the cipher's NonceSize (a typenum), not the
+    // cipher type itself; use the AeadCore associated NonceSize for the 12-byte GCM nonce.
+    let nonce = Nonce::<<Aes256Gcm as AeadCore>::NonceSize>::from_slice(nonce_bytes);
+    cipher
+        .decrypt(nonce, ct)
+        .map_err(|e| store(format!("seal decrypt: {e}")))
+}
+
 #[async_trait::async_trait]
 impl SecretEngine for RustyVaultEngine {
     async fn get(&self, path: &SecretPath) -> Result<Option<Vec<u8>>, TesseraError> {
@@ -421,5 +463,27 @@ mod tests {
         let p = SecretPath::new("femto", "broker/token");
         eng.put(&p, b"abc".to_vec()).await.unwrap();
         assert_eq!(eng.get(&p).await.unwrap(), Some(b"abc".to_vec()));
+    }
+}
+
+#[cfg(test)]
+mod seal_tests {
+    use super::{seal_decrypt, seal_encrypt};
+
+    #[test]
+    fn encrypt_then_decrypt_roundtrips() {
+        let mk = b"master-key-abc";
+        let plaintext = br#"{"root_token":"tok","shares":["a","b"]}"#;
+        let blob = seal_encrypt(mk, plaintext).unwrap();
+        // nonce(12) is prepended, so the ciphertext is longer than plaintext.
+        assert!(blob.len() > plaintext.len());
+        let back = seal_decrypt(mk, &blob).unwrap();
+        assert_eq!(back, plaintext);
+    }
+
+    #[test]
+    fn wrong_master_key_fails_to_decrypt() {
+        let blob = seal_encrypt(b"right-key", b"secret-material").unwrap();
+        assert!(seal_decrypt(b"wrong-key", &blob).is_err());
     }
 }
