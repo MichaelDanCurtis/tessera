@@ -63,6 +63,8 @@ impl VaultStore {
                 scope: path.scope(),
                 token_hash: token_hash(token),
                 outcome: false,
+                timestamp: self.clock.now_rfc3339(),
+                reveal: false,
             });
             return Err(e);
         }
@@ -70,11 +72,30 @@ impl VaultStore {
     }
 
     fn record(&self, op: AuditOp, path: &SecretPath, token: &str, outcome: bool) {
+        self.record_inner(op, path, token, outcome, false);
+    }
+
+    /// Like `record`, but flags the entry as a reveal (operator saw plaintext).
+    #[allow(dead_code)]
+    fn record_reveal(&self, path: &SecretPath, token: &str, outcome: bool) {
+        self.record_inner(AuditOp::Read, path, token, outcome, true);
+    }
+
+    fn record_inner(
+        &self,
+        op: AuditOp,
+        path: &SecretPath,
+        token: &str,
+        outcome: bool,
+        reveal: bool,
+    ) {
         self.audit.append(AuditRecord {
             op,
             scope: path.scope(),
             token_hash: token_hash(token),
             outcome,
+            timestamp: self.clock.now_rfc3339(),
+            reveal,
         });
     }
 

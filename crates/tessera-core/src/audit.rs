@@ -17,12 +17,17 @@ pub enum AuditOp {
 }
 
 /// One audit entry. `outcome` is true on success, false on denial/failure.
+/// `timestamp` is an RFC-3339 instant from the injected `Clock`. `reveal` marks
+/// a `Read` that returned plaintext to an operator via the console reveal path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditRecord {
     pub op: AuditOp,
     pub scope: String,
     pub token_hash: String,
     pub outcome: bool,
+    pub timestamp: String,
+    #[serde(default)]
+    pub reveal: bool,
 }
 
 /// Append-only audit sink. V1 is in-memory + flush-to-writer; hash-chaining is
@@ -69,17 +74,36 @@ mod tests {
             scope: "secret/galvo/openai".into(),
             token_hash: token_hash("t"),
             outcome: true,
+            timestamp: "t".into(),
+            reveal: false,
         });
         a.append(AuditRecord {
             op: AuditOp::Read,
             scope: "secret/galvo/openai".into(),
             token_hash: token_hash("t"),
             outcome: true,
+            timestamp: "t".into(),
+            reveal: false,
         });
         let recs = a.records();
         assert_eq!(recs.len(), 2);
         assert_eq!(recs[0].op, AuditOp::Write);
         assert_eq!(recs[1].op, AuditOp::Read);
+    }
+
+    #[test]
+    fn record_carries_timestamp() {
+        let a = InMemoryAudit::new();
+        a.append(AuditRecord {
+            op: AuditOp::Read,
+            scope: "secret/galvo/openai".into(),
+            token_hash: token_hash("t"),
+            outcome: true,
+            timestamp: "2026-06-14T00:00:00Z".into(),
+            reveal: false,
+        });
+        assert_eq!(a.records()[0].timestamp, "2026-06-14T00:00:00Z");
+        assert!(!a.records()[0].reveal);
     }
 
     #[test]
