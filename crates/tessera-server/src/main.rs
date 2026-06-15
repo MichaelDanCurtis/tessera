@@ -61,13 +61,13 @@ async fn main() {
 
     // Seed an admin policy + static admin token from env so the Galvo proxy can
     // administer the vault out of the box. The admin token is a STATIC inline
-    // token granting sys/ (and secret/ so it can also drive the KV path on
-    // behalf of operators) — it is never persisted to tokens.json.
+    // token granting sys/, secret/, and pki/ so it can drive the KV and trust
+    // paths on behalf of operators — it is never persisted to tokens.json.
     if let Some(admin) = &cfg.admin_token {
         policies
-            .put("admin", Policy::new(["sys/", "secret/"]))
+            .put("admin", Policy::new(["sys/", "secret/", "pki/"]))
             .expect("seed admin policy");
-        tokens.insert(admin.clone(), Policy::new(["sys/", "secret/"]));
+        tokens.insert(admin.clone(), Policy::new(["sys/", "secret/", "pki/"]));
     }
 
     let vault = VaultStore::new(

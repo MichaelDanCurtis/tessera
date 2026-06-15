@@ -4,7 +4,7 @@
 
 Tessera is a small, fast secrets vault written in Rust. It speaks a **HashiCorp-Vault-compatible KV-v2 HTTP API**, so existing Vault clients work against it largely unchanged, and it stores everything encrypted at rest using the **NIST/OpenSSL** cryptography suite (AES-256-GCM, SHA-2) — never the ShangMi/SM suite. It is built on [RustyVault](https://github.com/Tongsuo-Project/RustyVault) as the embedded storage/crypto core, with all of the higher-level behaviour (versioning, policy, audit, persistence) implemented in Tessera itself.
 
-> **Status:** V1.1 — a restart-safe vault with full KV-v2 versioning. 68 tests green; `clippy -D warnings` and `rustfmt` clean. PKI (V1.5) and the consumer integrations are on the roadmap below.
+> **Status:** V1.2 — a restart-safe vault with full KV-v2 versioning plus an initial authenticated SPIFFE SVID issue API. Full PKI CA hardening and consumer integrations continue on the roadmap below.
 
 ---
 
@@ -14,6 +14,7 @@ Tessera is a small, fast secrets vault written in Rust. It speaks a **HashiCorp-
 - **Durable** — secrets and their version history survive process restart. The vault initializes once and unseals on subsequent boots.
 - **Sealed at rest** — everything on disk is encrypted; the vault's own unseal material is itself sealed under an operator-supplied **master key**. Nothing sensitive is ever written in plaintext or logged.
 - **Path-scoped tokens** — every request is authenticated by a token whose policy allow-lists the secret paths it may touch. Out-of-scope access is denied **fail-closed**, before the storage engine is ever consulted.
+- **SPIFFE SVID issuance** — Tessera can mint a short-lived X.509 SVID for a trusted Femto secure entity through a narrow `pki/spiffe/` policy scope.
 - **Append-only audit** — every secret operation and every auth denial is recorded; raw tokens are hashed (blake3), never stored.
 - **Vault-compatible** — the KV-v2 path layout and `sys/health` semantics match HashiCorp Vault closely enough that standard read-only Vault tooling works against Tessera (verified by a contract test).
 
@@ -89,6 +90,27 @@ Default mount is `secret`; `{path}` is multi-segment.
 
 **Check-and-set (CAS):** `options.cas = N` writes only if `N` equals the current version; `cas = 0` means "create only if absent." Setting `cas_required` on a secret rejects any write that omits `cas`.
 
+## API surface (PKI)
+
+SPIFFE SVID issuance requires a token scoped to `pki/spiffe/` and accepts either `X-Vault-Token: <token>` or `Authorization: Bearer <token>`.
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/v1/pki/spiffe/issue` | Issue a short-lived X.509 SVID for a SPIFFE ID inside the requested trust domain. |
+
+Request:
+
+```json
+{
+  "trustDomain": "femto.local",
+  "spiffeId": "spiffe://femto.local/corp/project/run/run-123",
+  "ttlSeconds": 900,
+  "profile": "femto-secure-entity-v0"
+}
+```
+
+Response data includes `provider`, `issuer`, `trust_domain`, `spiffe_id`, `certificate_profile`, `certificate_serial`, `decision_id`, `not_before`, `not_after`, `certificate_pem`, `private_key_pem`, and `status`. The private key is returned only in the issue response; callers should treat it as single-use runtime material.
+
 ---
 
 ## Architecture
@@ -119,6 +141,7 @@ The storage engine is a primitive **blob store**; all KV-v2 version semantics li
 - **Encryption at rest.** Every secret is encrypted on disk with the **NIST/OpenSSL** suite (AES-256-GCM, SHA-2). The crypto backend is pinned away from the ShangMi/SM (国密) suite and the server refuses to start if a non-NIST backend is configured.
 - **Master key & unseal.** RustyVault keeps its internal encryption keys *sealed*. They are protected by the operator-supplied master key, which is never written into the vault. On first boot the vault initializes and writes its unseal material into a `0600` sidecar (`tessera-seal.json.enc`) encrypted with AES-256-GCM under a key derived from the master key; on every later boot it decrypts that sidecar and unseals. A wrong master key fails closed.
 - **Fail-closed access.** Every operation runs *require-unsealed → authorize → act → audit*. An out-of-scope or unauthenticated request is denied before the storage engine is touched, so it cannot even learn whether a secret exists outside its scope.
+- **Scoped certificate issue.** SVID issue calls require `pki/spiffe/`, validate that the SPIFFE ID is inside the requested trust domain, and audit successful or rejected issue attempts as `issue_certificate`.
 - **No secret material in logs.** Tokens are hashed before audit; the master key and unseal shares never appear in logs, errors, or `Debug` output.
 
 > Single master key is the V1.1 model (right for a single instance). A multi-operator unseal ceremony (Shamir at the operator boundary) is a future hardening, not required for single-instance deployments.
@@ -142,7 +165,7 @@ Design docs live in the Galvo repo under `docs/superpowers/specs/` (the V1 and V
 
 ## Roadmap
 
-- **V1.5 — PKI.** Tessera becomes Lucidity's internal certificate authority via RustyVault's PKI engine: internal certs, service-mesh mTLS, and role keys, self-hosted. Public/external TLS via Let's Encrypt (ACME), managed by Tessera.
+- **V1.5 — Full PKI.** Tessera becomes Lucidity's internal certificate authority via RustyVault's PKI engine: internal certs, service-mesh mTLS, role keys, CA rotation, revocation, and CSR-based flows, self-hosted. Public/external TLS via Let's Encrypt (ACME), managed by Tessera.
 - **Consumers.** A Galvo secret broker (provider keys via Tessera instead of environment variables), a KubeNyx repoint onto Tessera's Vault-compatible API, Femto capsule identity, and an egress credential broker.
 - **Operator UI.** A read-first vault surface (seal state, secret paths, versions, audit — never values) exposed through the Galvo dashboard.
 - **Later.** Dynamic secrets, transit (encryption-as-a-service), multi-operator unseal, hash-chained audit, multi-node storage.

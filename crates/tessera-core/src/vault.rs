@@ -114,6 +114,17 @@ impl VaultStore {
         });
     }
 
+    /// Gate a non-KV action through the same seal + token policy path used by
+    /// secret operations. Authorization failures are audited as `AuthFailure`.
+    pub fn authorize_scope(&self, token: &str, path: &SecretPath) -> Result<(), TesseraError> {
+        self.guard(token, path)
+    }
+
+    /// Record a non-KV action after its route has passed `authorize_scope`.
+    pub fn record_action(&self, op: AuditOp, path: &SecretPath, token: &str, outcome: bool) {
+        self.record(op, path, token, outcome);
+    }
+
     /// Acquire (creating if absent) the per-path lock handle. The returned `Arc`
     /// guards a `tokio::sync::Mutex<()>` the caller `.lock().await`s around its RMW.
     fn path_lock(&self, path: &SecretPath) -> Arc<tokio::sync::Mutex<()>> {

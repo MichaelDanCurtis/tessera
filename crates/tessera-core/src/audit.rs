@@ -15,6 +15,7 @@ pub enum AuditOp {
     Undelete,
     Destroy,
     ConfigMetadata,
+    IssueCertificate,
     List,
     AuthFailure,
 }
