@@ -5,31 +5,51 @@ use std::sync::Arc;
 
 use tessera_core::audit::InMemoryAudit;
 use tessera_core::auth::{Policy, TokenStore};
-use tessera_core::engine::{InMemoryEngine, SecretEngine};
-use tessera_core::kv::KvStore;
+use tessera_core::clock::FixedClock;
+use tessera_core::engine::InMemoryEngine;
 use tessera_core::seal::SealState;
 use tessera_core::types::{SecretPath, SecretValue};
+use tessera_core::vault::VaultStore;
 use tessera_server::app::{router, AppState};
 
-fn spawn_unsealed_with_secrets() -> AppState {
+async fn spawn_unsealed_with_secrets() -> AppState {
     let mut tokens = TokenStore::new();
     tokens.insert("galvo-tok", Policy::new(["secret/"]));
     let seal = SealState::new(b"m".to_vec());
     seal.unseal(b"m").unwrap();
-    let engine = InMemoryEngine::new("2026-06-14T00:00:00Z");
-    // Seed two secrets under secret/galvo so list returns both.
+    let vault = VaultStore::new(
+        Arc::new(InMemoryEngine::new()),
+        seal,
+        tokens,
+        Arc::new(InMemoryAudit::new()),
+        Arc::new(FixedClock("2026-06-14T00:00:00Z".into())),
+    );
+    // Seed two secrets under secret/galvo so list returns both, each at version 1.
     let mut a = SecretValue::default();
     a.0.insert("api_key".into(), "1".into());
-    engine
-        .put(&SecretPath::new("secret", "galvo/openai"), a)
+    vault
+        .write(
+            "galvo-tok",
+            &SecretPath::new("secret", "galvo/openai"),
+            a,
+            None,
+        )
+        .await
         .unwrap();
     let mut b = SecretValue::default();
     b.0.insert("api_key".into(), "2".into());
-    engine
-        .put(&SecretPath::new("secret", "galvo/anthropic"), b)
+    vault
+        .write(
+            "galvo-tok",
+            &SecretPath::new("secret", "galvo/anthropic"),
+            b,
+            None,
+        )
+        .await
         .unwrap();
-    let kv = KvStore::new(engine, seal, tokens, InMemoryAudit::new());
-    AppState { kv: Arc::new(kv) }
+    AppState {
+        vault: Arc::new(vault),
+    }
 }
 
 async fn serve(state: AppState) -> String {
@@ -43,7 +63,7 @@ async fn serve(state: AppState) -> String {
 
 #[tokio::test]
 async fn kubenyx_status_list_metadata_contract() {
-    let base = serve(spawn_unsealed_with_secrets()).await;
+    let base = serve(spawn_unsealed_with_secrets().await).await;
     let client = reqwest::Client::new();
 
     // 1. vault/status -> GET /v1/sys/health -> 200 {"sealed":false}
@@ -55,7 +75,7 @@ async fn kubenyx_status_list_metadata_contract() {
     assert_eq!(res.status(), 200);
     assert_eq!(res.text().await.unwrap(), r#"{"sealed":false}"#);
 
-    // 2. vault/list_secrets -> GET /v1/secret/metadata/galvo?list=true -> {"data":{"keys":[...]}}
+    // 2. vault/list_secrets -> GET /v1/secret/metadata/galvo?list=true
     let res = client
         .get(format!("{base}/v1/secret/metadata/galvo"))
         .query(&[("list", "true")])
@@ -73,7 +93,7 @@ async fn kubenyx_status_list_metadata_contract() {
         .collect();
     assert_eq!(keys, vec!["anthropic".to_string(), "openai".to_string()]);
 
-    // 3. vault/read_metadata -> GET /v1/secret/metadata/galvo/openai -> {"data":{"current_version":1,...}}
+    // 3. vault/read_metadata -> GET /v1/secret/metadata/galvo/openai -> current_version:1
     let res = client
         .get(format!("{base}/v1/secret/metadata/galvo/openai"))
         .header("X-Vault-Token", "galvo-tok")
@@ -89,13 +109,16 @@ async fn kubenyx_status_list_metadata_contract() {
 async fn sealed_health_returns_503() {
     let state = {
         let seal = SealState::new(b"m".to_vec()); // left sealed
-        let kv = KvStore::new(
-            InMemoryEngine::new("t"),
+        let vault = VaultStore::new(
+            Arc::new(InMemoryEngine::new()),
             seal,
             TokenStore::new(),
-            InMemoryAudit::new(),
+            Arc::new(InMemoryAudit::new()),
+            Arc::new(FixedClock("t".into())),
         );
-        AppState { kv: Arc::new(kv) }
+        AppState {
+            vault: Arc::new(vault),
+        }
     };
     let base = serve(state).await;
     let res = reqwest::Client::new()
