@@ -42,6 +42,7 @@ use std::sync::Mutex;
 use std::sync::RwLock;
 
 use base64ct::{Base64, Encoding};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::sync::{mpsc, oneshot};
 
@@ -80,10 +81,11 @@ impl RustyVaultEngine {
     /// `master_key`. (Phase-1 form: init + unseal each open. Phase 3 replaces this
     /// body with init-if-empty-else-unseal + an encrypted seal sidecar so secrets
     /// survive restart; the `_master_key` arg is wired now so the signature is final.)
-    pub async fn open(data_dir: &str, _master_key: &[u8]) -> Result<Self, TesseraError> {
+    pub async fn open(data_dir: &str, master_key: &[u8]) -> Result<Self, TesseraError> {
         let data_dir = data_dir.to_string();
-        // Build Core + init + unseal + spawn the worker thread on a blocking task so
-        // the (non-Send) RustyVault setup never touches this async frame.
+        let master_key = master_key.to_vec();
+        // Build Core + init/unseal + spawn the worker thread on a dedicated OS thread
+        // so the (non-Send) RustyVault setup never touches this async frame.
         let (ready_tx, ready_rx) = oneshot::channel::<Result<String, TesseraError>>();
         let (tx, mut rx) = mpsc::unbounded_channel::<EngineJob>();
 
@@ -98,7 +100,7 @@ impl RustyVaultEngine {
                     }
                 };
                 rt.block_on(async move {
-                    let core = match build_core(&data_dir) {
+                    let core = match build_core(&data_dir, &master_key) {
                         Ok((core, root_token)) => {
                             let _ = ready_tx.send(Ok(root_token.clone()));
                             (core, root_token)
@@ -216,10 +218,21 @@ async fn handle_job(
     guard.handle_request(&mut req).await
 }
 
-/// Construct + config + init + unseal an embedded `Core`, returning it (in its
-/// `std::sync::RwLock`) plus the minted root token. Runs on the worker thread.
-fn build_core(data_dir: &str) -> Result<(Arc<RwLock<Core>>, String), TesseraError> {
+/// Construct + config an embedded `Core`, then **init-if-empty, else unseal**,
+/// returning it (in its `std::sync::RwLock`) plus the root token. Runs on the
+/// worker thread, so all seal-file I/O and crypto here are synchronous.
+///
+/// First boot: `init`, capture the unseal shares + root token, and write an
+/// AES-256-GCM-encrypted seal sidecar (`<data_dir>/tessera-seal.json.enc`, 0600).
+/// Every later boot: read + decrypt that sidecar and replay the stored Shamir
+/// shares to `unseal` the existing on-disk barrier (no re-`init`), reusing the
+/// stored root token — so secrets persist across restart.
+fn build_core(
+    data_dir: &str,
+    master_key: &[u8],
+) -> Result<(Arc<RwLock<Core>>, String), TesseraError> {
     std::fs::create_dir_all(data_dir).map_err(|e| store(format!("create data_dir: {e}")))?;
+    let seal_path = format!("{data_dir}/tessera-seal.json.enc");
 
     let mut conf: HashMap<String, Value> = HashMap::new();
     conf.insert("path".to_string(), Value::String(data_dir.to_string()));
@@ -232,28 +245,92 @@ fn build_core(data_dir: &str) -> Result<(Arc<RwLock<Core>>, String), TesseraErro
         ..Default::default()
     }));
 
-    let init_result = {
-        let mut c = core.write().expect("core lock poisoned (init)");
+    // config registers logical backends; required on both the init and unseal paths.
+    {
+        let mut c = core.write().expect("core lock poisoned (config)");
         c.config(Arc::clone(&core), None)
             .map_err(|e| store(format!("config: {e}")))?;
-        c.init(&SealConfig {
-            secret_shares: 5,
-            secret_threshold: 3,
-        })
-        .map_err(|e| store(format!("init: {e}")))?
-    };
-    {
-        let mut c = core.write().expect("core lock poisoned (unseal)");
-        for share in init_result.secret_shares.iter().take(3) {
-            c.unseal(share).map_err(|e| store(format!("unseal: {e}")))?;
-        }
     }
 
-    Ok((core, init_result.root_token))
+    let root_token = if std::path::Path::new(&seal_path).exists() {
+        // --- RESTART: decrypt sidecar, unseal the existing barrier with stored shares ---
+        let enc = std::fs::read(&seal_path).map_err(|e| store(format!("read seal: {e}")))?;
+        let plain = seal_decrypt(master_key, &enc)?;
+        let material: SealMaterial = serde_json::from_slice(&plain)
+            .map_err(|e| store(format!("decode seal material: {e}")))?;
+        {
+            let mut c = core.write().expect("core lock poisoned (unseal)");
+            for share in &material.shares {
+                let bytes =
+                    Base64::decode_vec(share).map_err(|e| store(format!("decode share: {e}")))?;
+                c.unseal(&bytes)
+                    .map_err(|e| store(format!("unseal: {e}")))?;
+            }
+        }
+        material.root_token
+    } else {
+        // --- FIRST BOOT: init, persist encrypted seal material, unseal ---
+        let init_result = {
+            let mut c = core.write().expect("core lock poisoned (init)");
+            c.init(&SealConfig {
+                secret_shares: 5,
+                secret_threshold: 3,
+            })
+            .map_err(|e| store(format!("init: {e}")))?
+        };
+        // Persist only the shares needed to meet threshold (3 of 5).
+        let shares: Vec<String> = init_result
+            .secret_shares
+            .iter()
+            .take(3)
+            .map(|s| Base64::encode_string(s))
+            .collect();
+        let material = SealMaterial {
+            root_token: init_result.root_token.clone(),
+            shares: shares.clone(),
+        };
+        let plain = serde_json::to_vec(&material)
+            .map_err(|e| store(format!("encode seal material: {e}")))?;
+        let enc = seal_encrypt(master_key, &plain)?;
+        write_seal_file(&seal_path, &enc)?;
+
+        {
+            let mut c = core.write().expect("core lock poisoned (unseal)");
+            for share in &shares {
+                let bytes =
+                    Base64::decode_vec(share).map_err(|e| store(format!("decode share: {e}")))?;
+                c.unseal(&bytes)
+                    .map_err(|e| store(format!("unseal: {e}")))?;
+            }
+        }
+        init_result.root_token
+    };
+
+    Ok((core, root_token))
 }
 
 fn store(msg: impl Into<String>) -> TesseraError {
     TesseraError::Storage(msg.into())
+}
+
+/// The unseal material persisted (encrypted) in the seal sidecar.
+#[derive(Serialize, Deserialize)]
+struct SealMaterial {
+    root_token: String,
+    /// Base64-encoded unseal shares (threshold count).
+    shares: Vec<String>,
+}
+
+/// Write the seal sidecar with `0600` perms (owner read/write only).
+fn write_seal_file(path: &str, bytes: &[u8]) -> Result<(), TesseraError> {
+    std::fs::write(path, bytes).map_err(|e| store(format!("write seal: {e}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(path, perms).map_err(|e| store(format!("chmod seal: {e}")))?;
+    }
+    Ok(())
 }
 
 /// Encrypt the seal material with AES-256-GCM. The key is SHA-256(master_key); a
@@ -463,6 +540,30 @@ mod tests {
         let p = SecretPath::new("femto", "broker/token");
         eng.put(&p, b"abc".to_vec()).await.unwrap();
         assert_eq!(eng.get(&p).await.unwrap(), Some(b"abc".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn secrets_survive_reopen_same_dir_and_key() {
+        let dir = temp_dir("restart");
+        let p = SecretPath::new("secret", "galvo/openai");
+        {
+            let eng = RustyVaultEngine::open(&dir, MK).await.unwrap();
+            eng.put(&p, b"persist-me".to_vec()).await.unwrap();
+        } // engine dropped — simulates process exit
+          // Re-open the SAME dir with the SAME master key: unseal path, not re-init.
+        let eng2 = RustyVaultEngine::open(&dir, MK).await.unwrap();
+        assert_eq!(eng2.get(&p).await.unwrap(), Some(b"persist-me".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn reopen_with_wrong_key_fails() {
+        let dir = temp_dir("wrongkey");
+        {
+            let _eng = RustyVaultEngine::open(&dir, MK).await.unwrap();
+        }
+        assert!(RustyVaultEngine::open(&dir, b"a-different-master-key")
+            .await
+            .is_err());
     }
 }
 
