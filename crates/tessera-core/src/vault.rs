@@ -11,7 +11,10 @@ use crate::auth::TokenStore;
 use crate::clock::Clock;
 use crate::engine::SecretEngine;
 use crate::seal::SealState;
-use crate::types::{SecretPath, SecretValue, TesseraError, Version, VersionMeta, VersionedSecret};
+use crate::types::{
+    SecretPath, SecretValue, TesseraError, Version, VersionMeta, VersionedSecret,
+    DEFAULT_MAX_VERSIONS,
+};
 
 pub struct VaultStore {
     engine: Arc<dyn SecretEngine>,
@@ -89,8 +92,15 @@ impl VaultStore {
         match self.engine.get(path).await? {
             None => Ok(None),
             Some(blob) => {
-                let vs: VersionedSecret = serde_json::from_slice(&blob)
+                let mut vs: VersionedSecret = serde_json::from_slice(&blob)
                     .map_err(|e| TesseraError::Storage(format!("decode VersionedSecret: {e}")))?;
+                // Corrupt-blob defense: a persisted record with max_versions == 0
+                // would make the write-trim window (`current - oldest + 1 > 0`)
+                // always true and underflow `oldest_version` past `current_version`
+                // (panic in debug / infinite loop in release). Clamp to the default.
+                if vs.max_versions == 0 {
+                    vs.max_versions = DEFAULT_MAX_VERSIONS;
+                }
                 Ok(Some(vs))
             }
         }
@@ -420,6 +430,58 @@ mod tests {
         let mut m = SecretValue::default();
         m.0.insert("api_key".into(), v.into());
         m
+    }
+
+    /// Build a store over a shared engine handle so a test can pre-seed a
+    /// corrupt on-disk blob before exercising the store.
+    fn store_with_engine(engine: Arc<InMemoryEngine>) -> VaultStore {
+        let mut tokens = TokenStore::new();
+        tokens.insert("galvo-tok", Policy::new(["secret/galvo/"]));
+        let seal = SealState::new(b"m".to_vec());
+        seal.unseal(b"m").unwrap();
+        VaultStore::new(
+            engine,
+            seal,
+            tokens,
+            Arc::new(InMemoryAudit::new()),
+            Arc::new(FixedClock("2026-06-14T00:00:00Z".into())),
+        )
+    }
+
+    #[tokio::test]
+    async fn corrupt_max_versions_zero_is_clamped_on_load_no_underflow() {
+        // A corrupted on-disk record with max_versions == 0 would make the
+        // write-trim loop `current - oldest + 1 > 0` always true and underflow
+        // `oldest_version += 1` past `current_version` (panic in debug / infinite
+        // loop). load() must clamp max_versions to >= 1 (DEFAULT) defensively.
+        let engine = Arc::new(InMemoryEngine::new());
+        let p = SecretPath::new("secret", "galvo/openai");
+
+        // Craft a record at version 1 with the poisoned max_versions == 0.
+        let mut vs = VersionedSecret::empty("2026-06-14T00:00:00Z".into());
+        vs.max_versions = 0;
+        vs.current_version = 1;
+        vs.oldest_version = 1;
+        vs.versions.insert(
+            1,
+            Version {
+                data: Some(val("seed")),
+                created_time: "2026-06-14T00:00:00Z".into(),
+                deletion_time: None,
+                destroyed: false,
+            },
+        );
+        let blob = serde_json::to_vec(&vs).unwrap();
+        engine.put(&p, blob).await.unwrap();
+
+        // A write must succeed without panicking or hanging.
+        let s = store_with_engine(Arc::clone(&engine));
+        let new_v = s.write("galvo-tok", &p, val("next"), None).await.unwrap();
+        assert_eq!(new_v, 2);
+
+        // The clamp restored a sane window.
+        let md = s.read_metadata("galvo-tok", &p).await.unwrap();
+        assert!(md.max_versions >= 1);
     }
 
     #[tokio::test]
