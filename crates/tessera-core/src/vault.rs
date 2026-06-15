@@ -201,23 +201,52 @@ impl VaultStore {
         Ok((value, meta))
     }
 
-    // --- stubs filled in Task 7 (declared now so the crate compiles) ---
     pub async fn read_metadata(
         &self,
-        _token: &str,
-        _path: &SecretPath,
+        token: &str,
+        path: &SecretPath,
     ) -> Result<VersionedSecret, TesseraError> {
-        todo!("Task 7")
+        self.guard(token, path)?;
+        match self.load(path).await? {
+            Some(vs) if vs.current_version > 0 => {
+                self.record(AuditOp::Read, path, token, true);
+                Ok(vs)
+            }
+            _ => {
+                self.record(AuditOp::Read, path, token, false);
+                Err(TesseraError::NotFound)
+            }
+        }
     }
 
     pub async fn configure_metadata(
         &self,
-        _token: &str,
-        _path: &SecretPath,
-        _max_versions: Option<u32>,
-        _cas_required: Option<bool>,
+        token: &str,
+        path: &SecretPath,
+        max_versions: Option<u32>,
+        cas_required: Option<bool>,
     ) -> Result<(), TesseraError> {
-        todo!("Task 7")
+        self.guard(token, path)?;
+        let lock = self.path_lock(path);
+        let _g = lock.lock().await;
+
+        let mut vs = match self.load(path).await? {
+            Some(vs) if vs.current_version > 0 => vs,
+            _ => {
+                self.record(AuditOp::ConfigMetadata, path, token, false);
+                return Err(TesseraError::NotFound);
+            }
+        };
+        if let Some(mv) = max_versions {
+            vs.max_versions = mv.max(1);
+        }
+        if let Some(cr) = cas_required {
+            vs.cas_required = cr;
+        }
+        vs.updated_time = self.clock.now_rfc3339();
+        self.save(path, &vs).await?;
+        self.record(AuditOp::ConfigMetadata, path, token, true);
+        Ok(())
     }
 }
 
@@ -395,5 +424,31 @@ mod tests {
         let md = s.read_metadata("galvo-tok", &p).await.unwrap();
         assert_eq!(md.oldest_version, 2);
         assert_eq!(md.current_version, 3);
+    }
+
+    #[tokio::test]
+    async fn read_metadata_reports_window_and_config() {
+        let s = store();
+        let p = SecretPath::new("secret", "galvo/openai");
+        s.write("galvo-tok", &p, val("v1"), None).await.unwrap();
+        s.write("galvo-tok", &p, val("v2"), None).await.unwrap();
+        let md = s.read_metadata("galvo-tok", &p).await.unwrap();
+        assert_eq!(md.current_version, 2);
+        assert_eq!(md.oldest_version, 1);
+        assert_eq!(md.max_versions, 10);
+        assert!(!md.cas_required);
+        assert_eq!(md.versions.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn configure_metadata_missing_secret_is_not_found() {
+        let s = store();
+        let p = SecretPath::new("secret", "galvo/none");
+        assert_eq!(
+            s.configure_metadata("galvo-tok", &p, Some(5), None)
+                .await
+                .unwrap_err(),
+            TesseraError::NotFound
+        );
     }
 }
