@@ -1,17 +1,15 @@
 use std::sync::Arc;
 
 use axum::Router;
-use tessera_core::audit::InMemoryAudit;
-use tessera_core::engine::InMemoryEngine;
-use tessera_core::kv::KvStore;
+use tessera_core::vault::VaultStore;
 
-/// Server state: the KvStore behind an Arc. V1 uses InMemoryEngine in tests;
-/// `main.rs` swaps RustyVaultEngine for production (same KvStore<_, _> shape via a boxed engine later).
-pub type AppKv = KvStore<InMemoryEngine, InMemoryAudit>;
-
+/// Server state: the `VaultStore` behind an Arc. `VaultStore` is a single concrete
+/// (non-generic) type holding `Arc<dyn SecretEngine>` + `Arc<dyn AuditSink>`, so
+/// `main.rs` injects `RustyVaultEngine` and tests inject `InMemoryEngine` without
+/// changing this state type.
 #[derive(Clone)]
 pub struct AppState {
-    pub kv: Arc<AppKv>,
+    pub vault: Arc<VaultStore>,
 }
 
 pub fn router(state: AppState) -> Router {
