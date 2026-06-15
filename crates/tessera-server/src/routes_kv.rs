@@ -12,7 +12,10 @@ use crate::app::AppState;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/v1/{mount}/data/{*path}", post(write).get(read).delete(delete_secret))
+        .route(
+            "/v1/{mount}/data/{*path}",
+            post(write).get(read).delete(delete_secret),
+        )
         .route("/v1/{mount}/metadata/{*path}", get(metadata_or_list))
 }
 
@@ -123,9 +126,9 @@ async fn metadata_or_list(
 #[cfg(test)]
 mod tests {
     use crate::app::{router, AppState};
-    use std::sync::Arc;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use std::sync::Arc;
     use tessera_core::audit::InMemoryAudit;
     use tessera_core::auth::{Policy, TokenStore};
     use tessera_core::engine::InMemoryEngine;
@@ -138,28 +141,44 @@ mod tests {
         tokens.insert("galvo-tok", Policy::new(["secret/galvo/"]));
         let seal = SealState::new(b"m".to_vec());
         seal.unseal(b"m").unwrap();
-        let kv = KvStore::new(InMemoryEngine::new("2026-06-14T00:00:00Z"), seal, tokens, InMemoryAudit::new());
+        let kv = KvStore::new(
+            InMemoryEngine::new("2026-06-14T00:00:00Z"),
+            seal,
+            tokens,
+            InMemoryAudit::new(),
+        );
         AppState { kv: Arc::new(kv) }
     }
 
     #[tokio::test]
     async fn write_then_read_data_path() {
         let app = router(state());
-        let w = app.clone().oneshot(
-            Request::post("/v1/secret/data/galvo/openai")
-                .header("X-Vault-Token", "galvo-tok")
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"data":{"api_key":"sk-1"}}"#)).unwrap()
-        ).await.unwrap();
+        let w = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/secret/data/galvo/openai")
+                    .header("X-Vault-Token", "galvo-tok")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"data":{"api_key":"sk-1"}}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(w.status(), StatusCode::OK);
 
-        let r = app.oneshot(
-            Request::get("/v1/secret/data/galvo/openai")
-                .header("X-Vault-Token", "galvo-tok")
-                .body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let r = app
+            .oneshot(
+                Request::get("/v1/secret/data/galvo/openai")
+                    .header("X-Vault-Token", "galvo-tok")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(r.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["data"]["data"]["api_key"], "sk-1");
     }
@@ -167,11 +186,15 @@ mod tests {
     #[tokio::test]
     async fn out_of_scope_read_forbidden() {
         let app = router(state());
-        let r = app.oneshot(
-            Request::get("/v1/secret/data/femto/key")
-                .header("X-Vault-Token", "galvo-tok")
-                .body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let r = app
+            .oneshot(
+                Request::get("/v1/secret/data/femto/key")
+                    .header("X-Vault-Token", "galvo-tok")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(r.status(), StatusCode::FORBIDDEN);
     }
 }
