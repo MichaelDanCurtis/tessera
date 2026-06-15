@@ -57,6 +57,17 @@ fn parse_op(s: &str) -> Option<AuditOp> {
     serde_json::from_value(Value::String(s.to_string())).ok()
 }
 
+/// Translate the audit `outcome` query param into the `AuditQuery` bool filter.
+/// `allow` -> keep `outcome == true`; `deny` -> keep `outcome == false`; any
+/// other value (incl. absent) yields `None` = no outcome filter.
+fn parse_outcome(s: &str) -> Option<bool> {
+    match s {
+        "allow" => Some(true),
+        "deny" => Some(false),
+        _ => None,
+    }
+}
+
 async fn audit_read(
     State(state): State<AppState>,
     Query(q): Query<BTreeMap<String, String>>,
@@ -68,7 +79,7 @@ async fn audit_read(
     let query = AuditQuery {
         prefix: q.get("prefix").cloned(),
         op: q.get("op").and_then(|s| parse_op(s)),
-        outcome: q.get("outcome").map(|s| s == "true"),
+        outcome: q.get("outcome").and_then(|s| parse_outcome(s)),
         since: q.get("since").cloned(),
         until: q.get("until").cloned(),
         limit: q.get("limit").and_then(|s| s.parse::<usize>().ok()),
@@ -388,6 +399,102 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn audit_read_outcome_filter_allow_and_deny() {
+        use tessera_core::audit::AuditRecord;
+
+        let (st, admin) = admin_state();
+        // Seed one allowed and one denied record.
+        st.vault.audit_sink().append(AuditRecord {
+            op: AuditOp::Read,
+            scope: "secret/galvo/a".into(),
+            token_hash: "h".into(),
+            outcome: true,
+            timestamp: "2026-06-14T00:00:01Z".into(),
+            reveal: false,
+        });
+        st.vault.audit_sink().append(AuditRecord {
+            op: AuditOp::AuthFailure,
+            scope: "secret/galvo/b".into(),
+            token_hash: "h".into(),
+            outcome: false,
+            timestamp: "2026-06-14T00:00:02Z".into(),
+            reveal: false,
+        });
+        let app = router(st);
+
+        // outcome=allow -> only the outcome==true record
+        let r = app
+            .clone()
+            .oneshot(admin_get("/v1/sys/audit?outcome=allow", &admin))
+            .await
+            .unwrap();
+        let entries = body_json(r).await["data"]["entries"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["outcome"], serde_json::json!(true));
+
+        // outcome=deny -> only the outcome==false record
+        let r = app
+            .clone()
+            .oneshot(admin_get("/v1/sys/audit?outcome=deny", &admin))
+            .await
+            .unwrap();
+        let entries = body_json(r).await["data"]["entries"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["outcome"], serde_json::json!(false));
+
+        // no outcome param -> both records
+        let r = app
+            .oneshot(admin_get("/v1/sys/audit", &admin))
+            .await
+            .unwrap();
+        let entries = body_json(r).await["data"]["entries"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn audit_read_op_filter_accepts_config_metadata() {
+        use tessera_core::audit::AuditRecord;
+
+        let (st, admin) = admin_state();
+        st.vault.audit_sink().append(AuditRecord {
+            op: AuditOp::ConfigMetadata,
+            scope: "secret/galvo/c".into(),
+            token_hash: "h".into(),
+            outcome: true,
+            timestamp: "2026-06-14T00:00:03Z".into(),
+            reveal: false,
+        });
+        st.vault.audit_sink().append(AuditRecord {
+            op: AuditOp::Read,
+            scope: "secret/galvo/d".into(),
+            token_hash: "h".into(),
+            outcome: true,
+            timestamp: "2026-06-14T00:00:04Z".into(),
+            reveal: false,
+        });
+        let app = router(st);
+        let r = app
+            .oneshot(admin_get("/v1/sys/audit?op=config_metadata", &admin))
+            .await
+            .unwrap();
+        let entries = body_json(r).await["data"]["entries"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["op"], serde_json::json!("config_metadata"));
     }
 
     #[tokio::test]
