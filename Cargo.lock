@@ -3353,12 +3353,15 @@ dependencies = [
 name = "tessera-server"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "axum",
+ "base64",
  "blake3",
  "rcgen",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tessera-core",
  "time",

@@ -14,8 +14,11 @@ path = "src/main.rs"
 
 [dependencies]
 tessera-core = { path = "../tessera-core" }
+aes-gcm = "0.10"
+base64 = "0.22.1"
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = "0.10"
 tokio = { workspace = true }
 axum = { workspace = true }
 blake3 = { workspace = true }
