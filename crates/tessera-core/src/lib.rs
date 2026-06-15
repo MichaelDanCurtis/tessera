@@ -3,6 +3,7 @@ pub mod audit;
 pub mod auth;
 pub mod clock;
 pub mod engine;
+pub mod persist;
 pub mod rusty_engine;
 pub mod seal;
 pub mod types;

@@ -20,14 +20,11 @@ impl Clock for FixedClock {
 /// RFC-3339 (UTC) formatter.
 pub struct SystemClock;
 
-impl Clock for SystemClock {
-    fn now_rfc3339(&self) -> String {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        // Civil-date conversion (days since 1970) — Howard Hinnant's algorithm.
+impl SystemClock {
+    /// Format a Unix-epoch-seconds instant as RFC-3339 UTC. Shared by the TTL
+    /// arithmetic in auth.rs so there is ONE civil-date formatter in the crate.
+    pub fn format_epoch(secs: i64) -> String {
+        let secs = secs.max(0) as u64;
         let days = (secs / 86_400) as i64;
         let rem = secs % 86_400;
         let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
@@ -42,6 +39,17 @@ impl Clock for SystemClock {
         let m = if mp < 10 { mp + 3 } else { mp - 9 };
         let y = if m <= 2 { y + 1 } else { y };
         format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
+    }
+}
+
+impl Clock for SystemClock {
+    fn now_rfc3339(&self) -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        Self::format_epoch(secs as i64)
     }
 }
 
