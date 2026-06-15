@@ -6,4 +6,4 @@ pub mod engine;
 pub mod rusty_engine;
 pub mod seal;
 pub mod types;
-// pub mod vault;  // added in Task 5
+pub mod vault;
