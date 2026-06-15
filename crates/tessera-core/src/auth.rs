@@ -342,7 +342,7 @@ impl TokenStore {
         let admin_path = SecretPath::new("sys", "");
         // static admin tokens: an inline policy allowing "sys/".
         if let Some(policy) = self.static_tokens.lock().unwrap().get(token) {
-            return policy.allow_prefixes.iter().any(|p| p.starts_with("sys"));
+            return policy.allow_prefixes.iter().any(|p| p.starts_with("sys/"));
         }
         let hash = token_hash(token);
         let map = self.records.lock().unwrap();
@@ -354,7 +354,7 @@ impl TokenStore {
                         .get(name)
                         .map(|p| {
                             p.allows(&admin_path)
-                                || p.allow_prefixes.iter().any(|x| x.starts_with("sys"))
+                                || p.allow_prefixes.iter().any(|x| x.starts_with("sys/"))
                         })
                         .unwrap_or(false)
                 })

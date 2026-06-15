@@ -72,7 +72,8 @@ impl VaultStore {
     /// returns the error (fail-closed, before any engine touch).
     fn guard(&self, token: &str, path: &SecretPath) -> Result<(), TesseraError> {
         self.seal.require_unsealed()?;
-        if let Err(e) = self.tokens.authorize(token, path, &self.policies) {
+        let now = self.clock.now_rfc3339();
+        if let Err(e) = self.tokens.authorize_at(token, path, &self.policies, &now) {
             self.audit.append(AuditRecord {
                 op: AuditOp::AuthFailure,
                 scope: path.scope(),
@@ -799,6 +800,52 @@ mod tests {
         let last = s.audit_sink().records().into_iter().last().unwrap();
         assert_eq!(last.op, AuditOp::Read);
         assert!(last.reveal, "reveal read must flag the audit entry");
+    }
+
+    /// REGRESSION (Critical fail-open): an expired dynamic token must be denied
+    /// on the REAL data-plane guard path (`write`/`read`), not just when calling
+    /// `authorize_at` directly. Build the store's clock PAST the token's expiry
+    /// and assert the op is rejected as `InvalidToken`.
+    #[tokio::test]
+    async fn expired_dynamic_token_denied_through_guard() {
+        // Named policy the issued token references (issue() validates the name).
+        let policies = Arc::new(PolicyStore::in_memory());
+        policies
+            .put("galvo", Policy::new(["secret/galvo/"]))
+            .unwrap();
+
+        // Issue a dynamic token at a base instant with a 60s TTL =>
+        // expires ~ 2026-06-14T00:01:00Z.
+        let tokens = TokenStore::new();
+        let issued = tokens
+            .issue(
+                vec!["galvo".into()],
+                Some(60),
+                "2026-06-14T00:00:00Z",
+                &policies,
+            )
+            .unwrap();
+
+        // Build the store's clock at a LATER instant (token already expired).
+        let seal = SealState::new(b"m".to_vec());
+        seal.unseal(b"m").unwrap();
+        let s = VaultStore::new(
+            Arc::new(InMemoryEngine::new()),
+            seal,
+            tokens,
+            policies,
+            Arc::new(InMemoryAudit::new()),
+            Arc::new(FixedClock("2026-06-14T01:00:00Z".into())),
+        );
+
+        let p = SecretPath::new("secret", "galvo/openai");
+        // A write through the data-plane guard MUST be denied (expired token).
+        assert_eq!(
+            s.write(&issued.token, &p, val("nope"), None)
+                .await
+                .unwrap_err(),
+            TesseraError::InvalidToken
+        );
     }
 
     #[tokio::test]
