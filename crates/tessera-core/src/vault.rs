@@ -248,6 +248,121 @@ impl VaultStore {
         self.record(AuditOp::ConfigMetadata, path, token, true);
         Ok(())
     }
+
+    pub async fn soft_delete(
+        &self,
+        token: &str,
+        path: &SecretPath,
+        versions: &[u32],
+    ) -> Result<(), TesseraError> {
+        self.mutate_versions(token, path, AuditOp::Delete, versions, |v, now| {
+            if !v.destroyed && v.deletion_time.is_none() {
+                v.deletion_time = Some(now.to_string());
+            }
+        })
+        .await
+    }
+
+    pub async fn undelete(
+        &self,
+        token: &str,
+        path: &SecretPath,
+        versions: &[u32],
+    ) -> Result<(), TesseraError> {
+        self.mutate_versions(token, path, AuditOp::Undelete, versions, |v, _now| {
+            // No-op on destroyed versions (data is gone for good).
+            if !v.destroyed {
+                v.deletion_time = None;
+            }
+        })
+        .await
+    }
+
+    pub async fn destroy(
+        &self,
+        token: &str,
+        path: &SecretPath,
+        versions: &[u32],
+    ) -> Result<(), TesseraError> {
+        self.mutate_versions(token, path, AuditOp::Destroy, versions, |v, _now| {
+            v.destroyed = true;
+            v.data = None;
+        })
+        .await
+    }
+
+    /// Shared RMW for the per-version mutators (soft-delete/undelete/destroy).
+    /// Absent versions are skipped (no-op, not an error). Missing secret => NotFound.
+    async fn mutate_versions(
+        &self,
+        token: &str,
+        path: &SecretPath,
+        op: AuditOp,
+        versions: &[u32],
+        mut f: impl FnMut(&mut Version, &str),
+    ) -> Result<(), TesseraError> {
+        self.guard(token, path)?;
+        let lock = self.path_lock(path);
+        let _g = lock.lock().await;
+        let mut vs = match self.load(path).await? {
+            Some(vs) if vs.current_version > 0 => vs,
+            _ => {
+                self.record(op, path, token, false);
+                return Err(TesseraError::NotFound);
+            }
+        };
+        let now = self.clock.now_rfc3339();
+        for &n in versions {
+            if let Some(v) = vs.versions.get_mut(&n) {
+                f(v, &now);
+            }
+        }
+        vs.updated_time = now;
+        self.save(path, &vs).await?;
+        self.record(op, path, token, true);
+        Ok(())
+    }
+
+    pub async fn delete_metadata(
+        &self,
+        token: &str,
+        path: &SecretPath,
+    ) -> Result<(), TesseraError> {
+        self.guard(token, path)?;
+        let lock = self.path_lock(path);
+        let _g = lock.lock().await;
+        // Engine delete is idempotent; report NotFound only if nothing was there.
+        let existed = self
+            .load(path)
+            .await?
+            .map(|vs| vs.current_version > 0)
+            .unwrap_or(false);
+        self.engine.delete(path).await?;
+        if !existed {
+            self.record(AuditOp::Delete, path, token, false);
+            return Err(TesseraError::NotFound);
+        }
+        self.record(AuditOp::Delete, path, token, true);
+        Ok(())
+    }
+
+    pub async fn list(
+        &self,
+        token: &str,
+        prefix: &SecretPath,
+    ) -> Result<Vec<String>, TesseraError> {
+        // A list prefix is a directory, e.g. `secret/galvo`. Authorize against its
+        // directory form (`secret/galvo/`) so a policy scoped to `secret/galvo/`
+        // permits listing that subtree without granting a bare `secret/galvo` leaf.
+        let dir = SecretPath::new(
+            prefix.mount.clone(),
+            format!("{}/", prefix.path.trim_end_matches('/')),
+        );
+        self.guard(token, &dir)?;
+        let res = self.engine.list(prefix).await;
+        self.record(AuditOp::List, prefix, token, res.is_ok());
+        res
+    }
 }
 
 #[cfg(test)]
@@ -450,5 +565,103 @@ mod tests {
                 .unwrap_err(),
             TesseraError::NotFound
         );
+    }
+
+    #[tokio::test]
+    async fn soft_delete_hides_data_undelete_restores() {
+        let s = store();
+        let p = SecretPath::new("secret", "galvo/openai");
+        s.write("galvo-tok", &p, val("v1"), None).await.unwrap();
+        s.soft_delete("galvo-tok", &p, &[1]).await.unwrap();
+        let (v, meta) = s.read("galvo-tok", &p, Some(1)).await.unwrap();
+        assert!(v.is_none());
+        assert!(meta.deletion_time.is_some());
+        s.undelete("galvo-tok", &p, &[1]).await.unwrap();
+        let (v, meta) = s.read("galvo-tok", &p, Some(1)).await.unwrap();
+        assert_eq!(v.unwrap().0.get("api_key").unwrap(), "v1");
+        assert!(meta.deletion_time.is_none());
+    }
+
+    #[tokio::test]
+    async fn destroy_removes_data_permanently_and_blocks_undelete() {
+        let s = store();
+        let p = SecretPath::new("secret", "galvo/openai");
+        s.write("galvo-tok", &p, val("v1"), None).await.unwrap();
+        s.destroy("galvo-tok", &p, &[1]).await.unwrap();
+        let (v, meta) = s.read("galvo-tok", &p, Some(1)).await.unwrap();
+        assert!(v.is_none());
+        assert!(meta.destroyed);
+        // undelete on a destroyed version is a no-op: data stays gone
+        s.undelete("galvo-tok", &p, &[1]).await.unwrap();
+        let (v, meta) = s.read("galvo-tok", &p, Some(1)).await.unwrap();
+        assert!(v.is_none());
+        assert!(meta.destroyed);
+    }
+
+    #[tokio::test]
+    async fn destroy_undelete_on_absent_version_is_noop() {
+        let s = store();
+        let p = SecretPath::new("secret", "galvo/openai");
+        s.write("galvo-tok", &p, val("v1"), None).await.unwrap();
+        // versions [42] don't exist; must not 500/error
+        s.destroy("galvo-tok", &p, &[42]).await.unwrap();
+        s.undelete("galvo-tok", &p, &[42]).await.unwrap();
+        s.soft_delete("galvo-tok", &p, &[42]).await.unwrap();
+        // v1 untouched
+        let (v, _) = s.read("galvo-tok", &p, Some(1)).await.unwrap();
+        assert_eq!(v.unwrap().0.get("api_key").unwrap(), "v1");
+    }
+
+    #[tokio::test]
+    async fn delete_metadata_wipes_all_versions() {
+        let s = store();
+        let p = SecretPath::new("secret", "galvo/openai");
+        s.write("galvo-tok", &p, val("v1"), None).await.unwrap();
+        s.write("galvo-tok", &p, val("v2"), None).await.unwrap();
+        s.delete_metadata("galvo-tok", &p).await.unwrap();
+        assert_eq!(
+            s.read("galvo-tok", &p, None).await.unwrap_err(),
+            TesseraError::NotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn list_returns_immediate_names() {
+        let s = store();
+        s.write(
+            "galvo-tok",
+            &SecretPath::new("secret", "galvo/openai"),
+            val("1"),
+            None,
+        )
+        .await
+        .unwrap();
+        s.write(
+            "galvo-tok",
+            &SecretPath::new("secret", "galvo/anthropic"),
+            val("2"),
+            None,
+        )
+        .await
+        .unwrap();
+        let keys = s
+            .list("galvo-tok", &SecretPath::new("secret", "galvo"))
+            .await
+            .unwrap();
+        assert_eq!(keys, vec!["anthropic".to_string(), "openai".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn new_ops_are_audited() {
+        let s = store();
+        let p = SecretPath::new("secret", "galvo/openai");
+        s.write("galvo-tok", &p, val("v1"), None).await.unwrap();
+        s.soft_delete("galvo-tok", &p, &[1]).await.unwrap();
+        s.undelete("galvo-tok", &p, &[1]).await.unwrap();
+        s.destroy("galvo-tok", &p, &[1]).await.unwrap();
+        let ops: Vec<_> = s.audit_sink().records().iter().map(|r| r.op).collect();
+        assert!(ops.contains(&AuditOp::Delete));
+        assert!(ops.contains(&AuditOp::Undelete));
+        assert!(ops.contains(&AuditOp::Destroy));
     }
 }
