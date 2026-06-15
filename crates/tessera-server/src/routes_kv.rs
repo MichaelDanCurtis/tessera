@@ -304,7 +304,7 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use std::sync::Arc;
     use tessera_core::audit::InMemoryAudit;
-    use tessera_core::auth::{Policy, TokenStore};
+    use tessera_core::auth::{Policy, PolicyStore, TokenStore};
     use tessera_core::clock::FixedClock;
     use tessera_core::engine::InMemoryEngine;
     use tessera_core::seal::SealState;
@@ -320,6 +320,7 @@ mod tests {
             Arc::new(InMemoryEngine::new()),
             seal,
             tokens,
+            Arc::new(PolicyStore::in_memory()),
             Arc::new(InMemoryAudit::new()),
             Arc::new(FixedClock("2026-06-14T00:00:00Z".into())),
         );
