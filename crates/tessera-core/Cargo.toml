@@ -9,3 +9,13 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 blake3 = { workspace = true }
+# RustyVault embedded engine (Task 9). `crypto_adaptor_openssl` pins the vanilla
+# crates.io OpenSSL backend; `crypto_adaptor_tongsuo` (ShangMi/SM, 国密) is the
+# mutually-exclusive alternative and is NEVER enabled. `default-features = false`
+# so a future upstream default flip cannot silently swap the crypto backend.
+# Pinned to the crates.io 0.2.1 release (NOT a git dep on main, whose workspace
+# root activates a Tongsuo openssl [patch.crates-io]). See docs/spike-rustyvault.md.
+rusty_vault = { version = "0.2.1", default-features = false, features = ["crypto_adaptor_openssl"] }
+# Sync->async bridge: a dedicated current-thread runtime drives Core::handle_request
+# (async) from the sync SecretEngine methods. `rt` only; no multi-thread needed.
+tokio = { version = "1", default-features = false, features = ["rt"] }
