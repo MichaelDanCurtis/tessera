@@ -31,6 +31,8 @@ base64ct = { version = "1", features = ["alloc"] }
 # `rt-multi-thread` + `macros` enable `#[tokio::test]`; `sync` enables
 # tokio::sync::{RwLock, Mutex} (the async-aware Core guard + per-path RMW lock).
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "macros", "sync"] }
+base64 = "0.22.1"
+rand = "0.8"
 
 [dev-dependencies]
 # Temp dirs for persistence tests (FileAuditSink, PolicyStore, TokenStore).
