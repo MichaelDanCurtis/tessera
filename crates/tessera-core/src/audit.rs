@@ -1,6 +1,9 @@
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
+
+use crate::persist::{append_jsonl, read_jsonl_lines};
 
 /// The kind of operation being audited.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,6 +100,54 @@ impl AuditSink for InMemoryAudit {
     fn append(&self, record: AuditRecord) {
         self.log.lock().unwrap().push(record);
     }
+    fn records(&self) -> Vec<AuditRecord> {
+        self.log.lock().unwrap().clone()
+    }
+}
+
+/// Append-only, restart-durable audit sink. Each record is one JSON line in
+/// `<data_dir>/audit.log`. On `open` it loads existing lines into memory so
+/// `records()`/`query()` are O(n) in-process; every `append` also writes the
+/// line to disk (flushed). Single-node; no hash-chaining yet.
+pub struct FileAuditSink {
+    path: PathBuf,
+    log: Mutex<Vec<AuditRecord>>,
+}
+
+impl FileAuditSink {
+    /// Open (or create) the audit log at `path`, loading any existing entries.
+    pub fn open(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let mut existing = Vec::new();
+        for line in read_jsonl_lines(&path)? {
+            // Skip corrupt lines defensively rather than refusing to start.
+            if let Ok(rec) = serde_json::from_str::<AuditRecord>(&line) {
+                existing.push(rec);
+            }
+        }
+        Ok(Self {
+            path,
+            log: Mutex::new(existing),
+        })
+    }
+}
+
+impl AuditSink for FileAuditSink {
+    fn append(&self, record: AuditRecord) {
+        // Best-effort durability: serialize + append to disk, then memory. A
+        // disk error must not panic the request path (audit is observability,
+        // not the security gate) — but it is logged to stderr.
+        if let Ok(line) = serde_json::to_string(&record) {
+            if let Err(e) = append_jsonl(&self.path, &line) {
+                eprintln!(
+                    "tessera: audit append to {} failed: {e}",
+                    self.path.display()
+                );
+            }
+        }
+        self.log.lock().unwrap().push(record);
+    }
+
     fn records(&self) -> Vec<AuditRecord> {
         self.log.lock().unwrap().clone()
     }
@@ -224,6 +275,40 @@ mod tests {
         let got = a.query(&q);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].scope, "secret/femto/c");
+    }
+
+    #[test]
+    fn file_audit_sink_persists_across_reopen() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("audit.log");
+        {
+            let sink = FileAuditSink::open(&path).unwrap();
+            sink.append(rec(
+                AuditOp::Write,
+                "secret/galvo/a",
+                true,
+                "2026-06-14T00:00:01Z",
+                false,
+            ));
+            sink.append(rec(
+                AuditOp::Read,
+                "secret/galvo/a",
+                true,
+                "2026-06-14T00:00:02Z",
+                true,
+            ));
+        } // drop — simulates process exit
+        let reopened = FileAuditSink::open(&path).unwrap();
+        let recs = reopened.records();
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[0].op, AuditOp::Write);
+        assert!(recs[1].reveal, "reveal marker survives reopen");
+        // query() works on the file sink too
+        let q = AuditQuery {
+            op: Some(AuditOp::Read),
+            ..Default::default()
+        };
+        assert_eq!(reopened.query(&q).len(), 1);
     }
 
     #[test]
