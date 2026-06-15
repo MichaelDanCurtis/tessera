@@ -1,11 +1,23 @@
 /// Loaded V1 server config.
-#[derive(Debug)]
 pub struct Config {
     pub bind: String,
     pub master_key: Vec<u8>,
     #[allow(dead_code)]
     pub data_dir: String,
     pub crypto_backend: String,
+}
+
+// Manual Debug that REDACTS the master key. `Config` needs `Debug` for tests'
+// `unwrap_err()`, but a vault must never let the master key reach a log/`dbg!`.
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("bind", &self.bind)
+            .field("master_key", &"<redacted>")
+            .field("data_dir", &self.data_dir)
+            .field("crypto_backend", &self.crypto_backend)
+            .finish()
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -89,5 +101,16 @@ mod tests {
         let cfg = from_getter(getter(&[("TESSERA_MASTER_KEY", "k")])).unwrap();
         assert_eq!(cfg.bind, "127.0.0.1:8200");
         assert_eq!(cfg.crypto_backend, "openssl");
+    }
+
+    #[test]
+    fn debug_redacts_master_key() {
+        let cfg = from_getter(getter(&[("TESSERA_MASTER_KEY", "super-secret-key")])).unwrap();
+        let rendered = format!("{cfg:?}");
+        assert!(rendered.contains("<redacted>"));
+        assert!(
+            !rendered.contains("super-secret-key"),
+            "master key must never appear in Debug output: {rendered}"
+        );
     }
 }
