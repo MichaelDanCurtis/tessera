@@ -25,6 +25,8 @@ sha2 = "0.10"
 # Pinned to the crates.io 0.2.1 release (NOT a git dep on main, whose workspace
 # root activates a Tongsuo openssl [patch.crates-io]). See docs/spike-rustyvault.md.
 rusty_vault = { version = "0.2.1", default-features = false, features = ["crypto_adaptor_openssl"] }
+# Base64-encode opaque blob bytes into RustyVault's KV-v1 JSON string field.
+base64ct = { version = "1", features = ["alloc"] }
 # Async engine: Core::handle_request is awaited directly (no nested runtime).
 # `rt-multi-thread` + `macros` enable `#[tokio::test]`; `sync` enables
 # tokio::sync::{RwLock, Mutex} (the async-aware Core guard + per-path RMW lock).

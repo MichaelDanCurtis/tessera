@@ -1,111 +1,135 @@
-//! RustyVault-backed [`SecretEngine`] (Task 9 — the single integration point with
-//! the real `rusty_vault` crate). Wraps an **in-process** `rusty_vault::core::Core`
-//! per the EMBED decision in `docs/spike-rustyvault.md`.
+//! RustyVault-backed [`SecretEngine`] — the single integration point with the real
+//! `rusty_vault` crate. Wraps an **in-process** `rusty_vault::core::Core` per the
+//! EMBED decision in `docs/spike-rustyvault.md`.
 //!
 //! ## Crypto backend
 //! Built against `rusty_vault`'s `crypto_adaptor_openssl` feature (vanilla crates.io
-//! OpenSSL); the Tongsuo/SM (ShangMi, 国密) adaptor is never enabled. See the
-//! `rusty_vault` dependency comment in `Cargo.toml`.
+//! OpenSSL); the Tongsuo/SM (ShangMi, 国密) adaptor is never enabled.
 //!
-//! ## KV semantics
-//! RustyVault 0.2.1 mounts KV as **v1** (single value, no history). Tessera's V1
-//! `SecretEngine` contract is also single-version (`current_version: 1`), so this
-//! wrapper round-trips a `SecretValue` map through the v1 KV logical backend and
-//! synthesizes the minimal `SecretMetadata`. KV-v2 REST shaping lives in the server
-//! (Task 11), not here.
+//! ## Blob storage
+//! V1.1's `SecretEngine` is an opaque blob store: each path holds one `Vec<u8>`.
+//! RustyVault's KV-v1 record is a JSON object, so the blob is base64-encoded into a
+//! single `"blob"` field. All KV-v2 versioning lives ABOVE this, in `VaultStore`.
 //!
-//! ## Sync -> async bridge (lock-guard hazard)
-//! `SecretEngine` methods are sync; `Core::handle_request` is `async` and lives
-//! behind a `std::sync::RwLock<Core>`. Each op clones the cheap `Arc<RwLock<Core>>`
-//! handle and the owned root token *before* entering `runtime.block_on`, and only
-//! acquires the `core.read()` guard **inside** the async block — the guard's
-//! lifetime never spans the `block_on` boundary held by an outside binding (the
-//! deadlock documented in the `rust-sync-mutex-held-across-block-on` skill).
+//! ## Async over a non-`Send`, `std::sync`-bound `Core` (DEVIATION FROM PLAN)
+//! The plan specified `Arc<tokio::sync::RwLock<Core>>` with `handle_request` awaited
+//! directly inside the `#[async_trait]` methods. That does NOT compile against
+//! `rusty_vault` 0.2.1 for two API-level reasons (see the Phase-1 report):
+//!   1. `Core::config(&mut self, core: Arc<std::sync::RwLock<Core>>, …)` stores
+//!      `self_ref: Option<Arc<std::sync::RwLock<Core>>>`, so `Core` is structurally
+//!      bound to **`std::sync::RwLock<Core>`** — a `tokio::sync::RwLock<Core>` is a
+//!      distinct type and is rejected (E0308).
+//!   2. `Core::handle_request(&self)` binds a `std::sync::RwLockReadGuard`
+//!      (`self.handlers.read()?`, non-`Send`) and holds it across its internal
+//!      `.await`s, so the returned future is **`!Send`**. `#[async_trait]` boxes
+//!      futures as `Pin<Box<dyn Future + Send>>`, so the future cannot be awaited
+//!      from inside an `#[async_trait]` method (E0277).
+//!
+//! Resolution that keeps the LOCKED async `SecretEngine` trait intact: the embedded
+//! `Core` lives behind `std::sync::RwLock` on a **dedicated single-thread Tokio
+//! runtime pinned to its own OS thread**. Each async-trait method ships an
+//! `EngineJob` over an mpsc channel to that thread, which drives the `!Send`
+//! `handle_request` future to completion on its current-thread runtime and returns
+//! the (`Send`) result via a oneshot. The async-trait methods just `.await` the
+//! oneshot — Send-clean at the boundary, no `block_on` called from within an outer
+//! runtime (that would panic), and `Core` stays in the `std::sync::RwLock` its own
+//! API demands. Concurrency is serialized through the worker thread (acceptable for
+//! V1.1; the per-path RMW lock in `VaultStore` already serializes writes).
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::RwLock;
 
+use base64ct::{Base64, Encoding};
 use serde_json::{Map, Value};
+use tokio::sync::{mpsc, oneshot};
 
 use rusty_vault::core::{Core, SealConfig};
 use rusty_vault::logical::{Operation, Request, Response};
 use rusty_vault::storage::{self, barrier_aes_gcm::AESGCMBarrier};
 
 use crate::engine::SecretEngine;
-use crate::types::{SecretMetadata, SecretPath, SecretValue, TesseraError};
+use crate::types::{SecretPath, TesseraError};
 
 /// The crypto provider this engine is pinned to (vanilla OpenSSL, never ShangMi).
 const CRYPTO_BACKEND: &str = "openssl";
 
-/// RustyVault-backed engine wrapping an in-process `Core`.
+/// One request dispatched to the dedicated `Core` worker thread.
+struct EngineJob {
+    ctx: &'static str,
+    op: Operation,
+    path: String,
+    body: Option<Map<String, Value>>,
+    reply: oneshot::Sender<Result<Option<Response>, TesseraError>>,
+}
+
+/// RustyVault-backed engine. The embedded `Core` is owned by a dedicated OS thread
+/// running a current-thread Tokio runtime; all requests are funnelled to it over
+/// `tx`. See the module docs for why this indirection is required by the 0.2.1 API.
 pub struct RustyVaultEngine {
-    /// Shared handle to the embedded RustyVault core.
-    core: Arc<RwLock<Core>>,
-    /// Root token minted at init; authorizes the in-process KV requests.
-    root_token: String,
-    /// Dedicated current-thread runtime that drives `Core::handle_request`.
-    runtime: tokio::runtime::Runtime,
-    /// RustyVault mount points already created (KV v1). Seeded with the default
-    /// `secret/` mount that init provides out of the box; other mounts are created
-    /// lazily on first write so arbitrary `SecretPath::mount` values round-trip.
+    /// Channel to the dedicated `Core` worker thread.
+    tx: mpsc::UnboundedSender<EngineJob>,
+    /// KV-v1 mount points already created. Seeded with the default `secret/` mount;
+    /// other mounts are created lazily on first write.
     mounts: Mutex<std::collections::HashSet<String>>,
 }
 
 impl RustyVaultEngine {
-    /// Open (init + unseal) an embedded RustyVault at `data_dir` (on-disk file
-    /// backend). The engine is usable immediately after this returns.
-    pub fn open(data_dir: &str) -> Result<Self, TesseraError> {
-        // The file backend expects its root directory to exist (see RustyVault's
-        // own `test_backend`). Create it idempotently; no wall-clock involved.
-        std::fs::create_dir_all(data_dir).map_err(|e| store(format!("create data_dir: {e}")))?;
+    /// Open an embedded RustyVault at `data_dir` (on-disk file backend) using
+    /// `master_key`. (Phase-1 form: init + unseal each open. Phase 3 replaces this
+    /// body with init-if-empty-else-unseal + an encrypted seal sidecar so secrets
+    /// survive restart; the `_master_key` arg is wired now so the signature is final.)
+    pub async fn open(data_dir: &str, _master_key: &[u8]) -> Result<Self, TesseraError> {
+        let data_dir = data_dir.to_string();
+        // Build Core + init + unseal + spawn the worker thread on a blocking task so
+        // the (non-Send) RustyVault setup never touches this async frame.
+        let (ready_tx, ready_rx) = oneshot::channel::<Result<String, TesseraError>>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<EngineJob>();
 
-        // Storage: file backend wrapped in the AES-GCM security barrier.
-        let mut conf: HashMap<String, Value> = HashMap::new();
-        conf.insert("path".to_string(), Value::String(data_dir.to_string()));
-        let backend =
-            storage::new_backend("file", &conf).map_err(|e| store(format!("new_backend: {e}")))?;
-        let barrier = AESGCMBarrier::new(Arc::clone(&backend));
-        let core = Arc::new(RwLock::new(Core {
-            physical: backend,
-            barrier: Arc::new(barrier),
-            ..Default::default()
-        }));
-
-        // config -> init -> unseal (first boot). Short write critical section; no
-        // `.await` happens under this guard.
-        let init_result = {
-            let mut c = core
-                .write()
-                .map_err(|_| store("core lock poisoned (init)"))?;
-            c.config(Arc::clone(&core), None)
-                .map_err(|e| store(format!("config: {e}")))?;
-            c.init(&SealConfig {
-                secret_shares: 5,
-                secret_threshold: 3,
+        std::thread::Builder::new()
+            .name("tessera-rustyvault".to_string())
+            .spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread().build() {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(store(format!("runtime build: {e}"))));
+                        return;
+                    }
+                };
+                rt.block_on(async move {
+                    let core = match build_core(&data_dir) {
+                        Ok((core, root_token)) => {
+                            let _ = ready_tx.send(Ok(root_token.clone()));
+                            (core, root_token)
+                        }
+                        Err(e) => {
+                            let _ = ready_tx.send(Err(e));
+                            return;
+                        }
+                    };
+                    let (core, root_token) = core;
+                    while let Some(job) = rx.recv().await {
+                        let mapped = handle_job(&core, &root_token, job.op, &job.path, job.body)
+                            .await
+                            .map_err(|e| store(format!("{}: {e}", job.ctx)));
+                        let _ = job.reply.send(mapped);
+                    }
+                });
             })
-            .map_err(|e| store(format!("init: {e}")))?
-        };
+            .map_err(|e| store(format!("spawn worker: {e}")))?;
 
-        {
-            let mut c = core
-                .write()
-                .map_err(|_| store("core lock poisoned (unseal)"))?;
-            for share in init_result.secret_shares.iter().take(3) {
-                c.unseal(share).map_err(|e| store(format!("unseal: {e}")))?;
-            }
-        }
+        let root_token = ready_rx
+            .await
+            .map_err(|_| store("worker thread died during open"))??;
+        // root_token is retained on the worker thread; we only needed open to succeed.
+        let _ = root_token;
 
         let mut mounts = std::collections::HashSet::new();
         mounts.insert("secret".to_string());
 
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .map_err(|e| store(format!("runtime build: {e}")))?;
-
         Ok(Self {
-            core,
-            root_token: init_result.root_token,
-            runtime,
+            tx,
             mounts: Mutex::new(mounts),
         })
     }
@@ -115,52 +139,36 @@ impl RustyVaultEngine {
         CRYPTO_BACKEND
     }
 
-    /// RustyVault logical path for a secret: `<mount>/<path>` (KV v1 keying).
+    /// RustyVault logical path for a secret: `<mount>/<path>` (KV-v1 keying).
     fn logical_path(path: &SecretPath) -> String {
         format!("{}/{}", path.mount, path.path.trim_start_matches('/'))
     }
 
-    /// Run one `Core::handle_request` on the dedicated runtime, mapping any
-    /// `RvError` to `TesseraError::Storage` with `ctx` as the label.
-    ///
-    /// Lock-guard discipline (`rust-sync-mutex-held-across-block-on`): `core` (a
-    /// cheap `Arc` clone) and `token` (owned) are captured by value *before*
-    /// `block_on`, so no outer binding holds the `std::sync::RwLock` guard across
-    /// the call. The guard is acquired and dropped entirely inside the future.
-    ///
-    /// `handle_request(&self)` is RustyVault's only entry point and is `async`, so
-    /// the **read** guard must live across the single `.await` — this is the rare,
-    /// safe exception clippy's `await_holding_lock` warns about: it is a *read*
-    /// guard (concurrent reads never block each other, so no cross-thread stall),
-    /// and this is a single-threaded `block_on` with no other future contending
-    /// for the same lock on this runtime. The spike (`docs/spike-rustyvault.md`)
-    /// documents this exact pattern as the supported embed path.
-    #[allow(clippy::await_holding_lock)]
-    fn run(
+    /// Dispatch one `Core::handle_request` to the worker thread and await its reply.
+    async fn run(
         &self,
-        ctx: &str,
+        ctx: &'static str,
         op: Operation,
         path: &str,
         body: Option<Map<String, Value>>,
     ) -> Result<Option<Response>, TesseraError> {
-        let core = Arc::clone(&self.core);
-        let token = self.root_token.clone();
-        let path = path.to_string();
-        let resp = self.runtime.block_on(async move {
-            let mut req = Request::new(&path);
-            req.operation = op;
-            req.client_token = token;
-            req.body = body;
-            let guard = core.read().expect("core lock poisoned");
-            let out = guard.handle_request(&mut req).await;
-            drop(guard);
-            out
-        });
-        resp.map_err(|e| store(format!("{ctx}: {e}")))
+        let (reply, reply_rx) = oneshot::channel();
+        self.tx
+            .send(EngineJob {
+                ctx,
+                op,
+                path: path.to_string(),
+                body,
+                reply,
+            })
+            .map_err(|_| store("engine worker thread is gone"))?;
+        reply_rx
+            .await
+            .map_err(|_| store("engine worker dropped the reply"))?
     }
 
-    /// Ensure the RustyVault KV v1 backend is mounted at `<mount>/` (idempotent).
-    fn ensure_mount(&self, mount: &str) -> Result<(), TesseraError> {
+    /// Ensure the RustyVault KV-v1 backend is mounted at `<mount>/` (idempotent).
+    async fn ensure_mount(&self, mount: &str) -> Result<(), TesseraError> {
         {
             let known = self.mounts.lock().expect("mounts lock poisoned");
             if known.contains(mount) {
@@ -174,7 +182,8 @@ impl RustyVaultEngine {
             Operation::Write,
             &format!("sys/mounts/{mount}/"),
             Some(body),
-        )?;
+        )
+        .await?;
         self.mounts
             .lock()
             .expect("mounts lock poisoned")
@@ -183,94 +192,134 @@ impl RustyVaultEngine {
     }
 }
 
-/// Map a `SecretValue` (all-string map) into a RustyVault JSON body.
-fn to_body(value: &SecretValue) -> Map<String, Value> {
-    value
-        .0
-        .iter()
-        .map(|(k, v)| (k.clone(), Value::String(v.clone())))
-        .collect()
+/// Drive one `Core::handle_request` on the worker thread. The `std::sync` read
+/// guard is held across the single `.await`, but the worker runs a dedicated
+/// current-thread runtime with no other future contending for this lock, so there
+/// is no cross-thread stall — the same safe exception V1 documented. (RustyVault's
+/// `handle_request` future is itself `!Send` because it holds a `std::sync`
+/// `RwLockReadGuard` over `self.handlers` across its internal awaits; keeping it on
+/// this single-thread runtime is what makes the async `SecretEngine` trait
+/// implementable at all — see the module docs.)
+#[allow(clippy::await_holding_lock)]
+async fn handle_job(
+    core: &Arc<RwLock<Core>>,
+    root_token: &str,
+    op: Operation,
+    path: &str,
+    body: Option<Map<String, Value>>,
+) -> Result<Option<Response>, rusty_vault::errors::RvError> {
+    let mut req = Request::new(path);
+    req.operation = op;
+    req.client_token = root_token.to_string();
+    req.body = body;
+    let guard = core.read().expect("core lock poisoned");
+    guard.handle_request(&mut req).await
 }
 
-/// Map a RustyVault response data map back into a `SecretValue` (string values
-/// only; non-string entries are stringified defensively).
-fn from_data(data: &Map<String, Value>) -> SecretValue {
-    let mut out = SecretValue::default();
-    for (k, v) in data {
-        let s = match v {
-            Value::String(s) => s.clone(),
-            other => other.to_string(),
-        };
-        out.0.insert(k.clone(), s);
+/// Construct + config + init + unseal an embedded `Core`, returning it (in its
+/// `std::sync::RwLock`) plus the minted root token. Runs on the worker thread.
+fn build_core(data_dir: &str) -> Result<(Arc<RwLock<Core>>, String), TesseraError> {
+    std::fs::create_dir_all(data_dir).map_err(|e| store(format!("create data_dir: {e}")))?;
+
+    let mut conf: HashMap<String, Value> = HashMap::new();
+    conf.insert("path".to_string(), Value::String(data_dir.to_string()));
+    let backend =
+        storage::new_backend("file", &conf).map_err(|e| store(format!("new_backend: {e}")))?;
+    let barrier = AESGCMBarrier::new(Arc::clone(&backend));
+    let core = Arc::new(RwLock::new(Core {
+        physical: backend,
+        barrier: Arc::new(barrier),
+        ..Default::default()
+    }));
+
+    let init_result = {
+        let mut c = core.write().expect("core lock poisoned (init)");
+        c.config(Arc::clone(&core), None)
+            .map_err(|e| store(format!("config: {e}")))?;
+        c.init(&SealConfig {
+            secret_shares: 5,
+            secret_threshold: 3,
+        })
+        .map_err(|e| store(format!("init: {e}")))?
+    };
+    {
+        let mut c = core.write().expect("core lock poisoned (unseal)");
+        for share in init_result.secret_shares.iter().take(3) {
+            c.unseal(share).map_err(|e| store(format!("unseal: {e}")))?;
+        }
     }
-    out
+
+    Ok((core, init_result.root_token))
 }
 
 fn store(msg: impl Into<String>) -> TesseraError {
     TesseraError::Storage(msg.into())
 }
 
+#[async_trait::async_trait]
 impl SecretEngine for RustyVaultEngine {
-    fn put(&self, path: &SecretPath, value: SecretValue) -> Result<(), TesseraError> {
-        self.ensure_mount(&path.mount)?;
-        let body = to_body(&value);
+    async fn get(&self, path: &SecretPath) -> Result<Option<Vec<u8>>, TesseraError> {
+        let resp = self
+            .run("get", Operation::Read, &Self::logical_path(path), None)
+            .await?;
+        let data = match resp.and_then(|r| r.data) {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+        let b64 = match data.get("blob").and_then(Value::as_str) {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let bytes = Base64::decode_vec(b64).map_err(|e| store(format!("blob decode: {e}")))?;
+        Ok(Some(bytes))
+    }
+
+    async fn put(&self, path: &SecretPath, blob: Vec<u8>) -> Result<(), TesseraError> {
+        self.ensure_mount(&path.mount).await?;
+        let mut body = Map::new();
+        body.insert(
+            "blob".to_string(),
+            Value::String(Base64::encode_string(&blob)),
+        );
         self.run(
             "put",
             Operation::Write,
             &Self::logical_path(path),
             Some(body),
-        )?;
+        )
+        .await?;
         Ok(())
     }
 
-    fn get(&self, path: &SecretPath) -> Result<(SecretValue, SecretMetadata), TesseraError> {
-        let resp = self.run("get", Operation::Read, &Self::logical_path(path), None)?;
-        // A missing secret comes back as `Ok(None)` (or a response with no data).
-        let data = resp.and_then(|r| r.data).ok_or(TesseraError::NotFound)?;
-        Ok((
-            from_data(&data),
-            SecretMetadata {
-                current_version: 1,
-                created_time: String::new(),
-            },
-        ))
-    }
-
-    fn delete(&self, path: &SecretPath) -> Result<(), TesseraError> {
-        // RustyVault's KV v1 delete is idempotent and does not signal "missing".
-        // Probe first so the trait's NotFound contract holds.
-        self.metadata(path)?;
-        self.run("delete", Operation::Delete, &Self::logical_path(path), None)?;
+    async fn delete(&self, path: &SecretPath) -> Result<(), TesseraError> {
+        // KV-v1 delete is idempotent; "missing-ness" is the store layer's concern.
+        self.run("delete", Operation::Delete, &Self::logical_path(path), None)
+            .await?;
         Ok(())
     }
 
-    fn list(&self, prefix: &SecretPath) -> Result<Vec<String>, TesseraError> {
-        // RustyVault list expects a trailing slash on the directory path.
+    async fn list(&self, prefix: &SecretPath) -> Result<Vec<String>, TesseraError> {
         let mut p = Self::logical_path(prefix);
         if !p.ends_with('/') {
             p.push('/');
         }
-        let resp = match self.run("list", Operation::List, &p, None) {
+        let resp = match self.run("list", Operation::List, &p, None).await {
             Ok(r) => r,
-            // An empty / non-existent prefix lists as empty rather than erroring.
             Err(_) => return Ok(Vec::new()),
         };
-        let keys = resp
+        let mut keys: Vec<String> = resp
             .and_then(|r| r.data)
             .and_then(|d| d.get("keys").cloned())
             .and_then(|v| v.as_array().cloned())
             .unwrap_or_default()
             .into_iter()
             .filter_map(|v| v.as_str().map(str::to_string))
-            // Immediate names only; drop any nested-directory trailing slash.
             .map(|s| s.trim_end_matches('/').to_string())
             .filter(|s| !s.is_empty())
             .collect();
+        keys.sort();
+        keys.dedup();
         Ok(keys)
-    }
-
-    fn metadata(&self, path: &SecretPath) -> Result<SecretMetadata, TesseraError> {
-        self.get(path).map(|(_, meta)| meta)
     }
 }
 
@@ -281,9 +330,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     // Unique temp dir PER RUN. `open()` does a one-time RustyVault init, which
-    // errors ("already initialized") against a reused on-disk backend — so the
-    // dir must be fresh each run, not just per test name. Combine the test name
-    // with the pid and a process-local counter (no wall-clock in core).
+    // errors against a reused on-disk backend — so the dir must be fresh each run.
     fn temp_dir(name: &str) -> String {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -296,9 +343,13 @@ mod tests {
         )
     }
 
-    #[test]
-    fn crypto_backend_is_not_shangmi() {
-        let eng = RustyVaultEngine::open(&temp_dir("crypto")).unwrap();
+    const MK: &[u8] = b"test-master-key-0123456789";
+
+    #[tokio::test]
+    async fn crypto_backend_is_not_shangmi() {
+        let eng = RustyVaultEngine::open(&temp_dir("crypto"), MK)
+            .await
+            .unwrap();
         let backend = eng.crypto_backend();
         assert!(
             backend == "openssl" || backend == "native-rust",
@@ -308,74 +359,67 @@ mod tests {
         assert_ne!(backend, "sm");
     }
 
-    #[test]
-    fn put_then_get_roundtrips() {
-        let eng = RustyVaultEngine::open(&temp_dir("roundtrip")).unwrap();
+    #[tokio::test]
+    async fn put_then_get_roundtrips_blob() {
+        let eng = RustyVaultEngine::open(&temp_dir("roundtrip"), MK)
+            .await
+            .unwrap();
         let p = SecretPath::new("secret", "galvo/openai");
-        let mut v = SecretValue::default();
-        v.0.insert("api_key".into(), "sk-1".into());
-        eng.put(&p, v).unwrap();
-        let (got, meta) = eng.get(&p).unwrap();
-        assert_eq!(got.0.get("api_key").unwrap(), "sk-1");
-        assert_eq!(meta.current_version, 1);
+        eng.put(&p, b"opaque-bytes-\x00\x01\xff".to_vec())
+            .await
+            .unwrap();
+        let got = eng.get(&p).await.unwrap();
+        assert_eq!(got, Some(b"opaque-bytes-\x00\x01\xff".to_vec()));
     }
 
-    fn val(k: &str, v: &str) -> SecretValue {
-        let mut m = SecretValue::default();
-        m.0.insert(k.into(), v.into());
-        m
-    }
-
-    #[test]
-    fn get_missing_is_not_found() {
-        let eng = RustyVaultEngine::open(&temp_dir("missing")).unwrap();
+    #[tokio::test]
+    async fn get_missing_is_none() {
+        let eng = RustyVaultEngine::open(&temp_dir("missing"), MK)
+            .await
+            .unwrap();
         assert_eq!(
-            eng.get(&SecretPath::new("secret", "nope")),
-            Err(TesseraError::NotFound)
+            eng.get(&SecretPath::new("secret", "nope")).await.unwrap(),
+            None
         );
     }
 
-    #[test]
-    fn delete_removes_then_missing() {
-        let eng = RustyVaultEngine::open(&temp_dir("delete")).unwrap();
+    #[tokio::test]
+    async fn delete_removes_then_none() {
+        let eng = RustyVaultEngine::open(&temp_dir("delete"), MK)
+            .await
+            .unwrap();
         let p = SecretPath::new("secret", "galvo/openai");
-        eng.put(&p, val("k", "1")).unwrap();
-        eng.delete(&p).unwrap();
-        assert_eq!(eng.get(&p), Err(TesseraError::NotFound));
-        assert_eq!(eng.delete(&p), Err(TesseraError::NotFound));
+        eng.put(&p, b"x".to_vec()).await.unwrap();
+        eng.delete(&p).await.unwrap();
+        assert_eq!(eng.get(&p).await.unwrap(), None);
+        // idempotent delete
+        eng.delete(&p).await.unwrap();
     }
 
-    #[test]
-    fn list_returns_immediate_names_under_prefix() {
-        let eng = RustyVaultEngine::open(&temp_dir("list")).unwrap();
-        eng.put(&SecretPath::new("secret", "galvo/openai"), val("k", "1"))
+    #[tokio::test]
+    async fn list_returns_immediate_names_under_prefix() {
+        let eng = RustyVaultEngine::open(&temp_dir("list"), MK).await.unwrap();
+        eng.put(&SecretPath::new("secret", "galvo/openai"), b"1".to_vec())
+            .await
             .unwrap();
-        eng.put(&SecretPath::new("secret", "galvo/anthropic"), val("k", "2"))
+        eng.put(&SecretPath::new("secret", "galvo/anthropic"), b"2".to_vec())
+            .await
             .unwrap();
-        eng.put(&SecretPath::new("secret", "femto/key"), val("k", "3"))
+        eng.put(&SecretPath::new("secret", "femto/key"), b"3".to_vec())
+            .await
             .unwrap();
-        let mut keys = eng.list(&SecretPath::new("secret", "galvo")).unwrap();
+        let mut keys = eng.list(&SecretPath::new("secret", "galvo")).await.unwrap();
         keys.sort();
         assert_eq!(keys, vec!["anthropic".to_string(), "openai".to_string()]);
     }
 
-    #[test]
-    fn update_overwrites_single_version() {
-        let eng = RustyVaultEngine::open(&temp_dir("update")).unwrap();
-        let p = SecretPath::new("secret", "galvo/openai");
-        eng.put(&p, val("api_key", "old")).unwrap();
-        eng.put(&p, val("api_key", "new")).unwrap();
-        let (got, meta) = eng.get(&p).unwrap();
-        assert_eq!(got.0.get("api_key").unwrap(), "new");
-        assert_eq!(meta.current_version, 1);
-    }
-
-    #[test]
-    fn custom_mount_is_lazily_created() {
-        let eng = RustyVaultEngine::open(&temp_dir("mount")).unwrap();
+    #[tokio::test]
+    async fn custom_mount_is_lazily_created() {
+        let eng = RustyVaultEngine::open(&temp_dir("mount"), MK)
+            .await
+            .unwrap();
         let p = SecretPath::new("femto", "broker/token");
-        eng.put(&p, val("t", "abc")).unwrap();
-        let (got, _) = eng.get(&p).unwrap();
-        assert_eq!(got.0.get("t").unwrap(), "abc");
+        eng.put(&p, b"abc".to_vec()).await.unwrap();
+        assert_eq!(eng.get(&p).await.unwrap(), Some(b"abc".to_vec()));
     }
 }
