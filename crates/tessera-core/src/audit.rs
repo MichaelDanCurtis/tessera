@@ -9,6 +9,9 @@ pub enum AuditOp {
     Read,
     Write,
     Delete,
+    Undelete,
+    Destroy,
+    ConfigMetadata,
     List,
     AuthFailure,
 }

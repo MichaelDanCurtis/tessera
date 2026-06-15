@@ -15,7 +15,7 @@ pub fn routes() -> Router<AppState> {
 
 /// Vault-compatible health: 200 + {"sealed":false} unsealed, 503 + {"sealed":true} sealed.
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
-    let sealed = state.kv.seal_state().is_sealed();
+    let sealed = state.vault.seal_state().is_sealed();
     let code = if sealed {
         StatusCode::SERVICE_UNAVAILABLE
     } else {
@@ -25,7 +25,7 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn seal_status(State(state): State<AppState>) -> impl IntoResponse {
-    let sealed = state.kv.seal_state().is_sealed();
+    let sealed = state.vault.seal_state().is_sealed();
     Json(json!({ "sealed": sealed }))
 }
 
@@ -38,9 +38,10 @@ mod tests {
     use std::sync::Arc;
     use tessera_core::audit::InMemoryAudit;
     use tessera_core::auth::TokenStore;
+    use tessera_core::clock::FixedClock;
     use tessera_core::engine::InMemoryEngine;
-    use tessera_core::kv::KvStore;
     use tessera_core::seal::SealState;
+    use tessera_core::vault::VaultStore;
     use tower::ServiceExt; // oneshot
 
     fn state(unseal: bool) -> AppState {
@@ -48,13 +49,16 @@ mod tests {
         if unseal {
             seal.unseal(b"m").unwrap();
         }
-        let kv = KvStore::new(
-            InMemoryEngine::new("t"),
+        let vault = VaultStore::new(
+            Arc::new(InMemoryEngine::new()),
             seal,
             TokenStore::new(),
-            InMemoryAudit::new(),
+            Arc::new(InMemoryAudit::new()),
+            Arc::new(FixedClock("t".into())),
         );
-        AppState { kv: Arc::new(kv) }
+        AppState {
+            vault: Arc::new(vault),
+        }
     }
 
     #[tokio::test]

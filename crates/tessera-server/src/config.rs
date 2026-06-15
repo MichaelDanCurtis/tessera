@@ -2,7 +2,6 @@
 pub struct Config {
     pub bind: String,
     pub master_key: Vec<u8>,
-    #[allow(dead_code)]
     pub data_dir: String,
     pub crypto_backend: String,
 }

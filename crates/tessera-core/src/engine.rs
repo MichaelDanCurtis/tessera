@@ -1,63 +1,51 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-use crate::types::{SecretMetadata, SecretPath, SecretValue, TesseraError};
+use crate::types::{SecretPath, TesseraError};
 
-/// Storage seam. RustyVault and the in-memory test store both implement this.
-/// Single-version semantics: write replaces, no history.
+/// Primitive async blob store. Stores exactly one opaque `Vec<u8>` per path —
+/// it knows nothing about versions or metadata (that lives in `VaultStore`).
+/// `RustyVaultEngine` and the in-memory test store both implement this.
+#[async_trait::async_trait]
 pub trait SecretEngine: Send + Sync {
-    fn put(&self, path: &SecretPath, value: SecretValue) -> Result<(), TesseraError>;
-    fn get(&self, path: &SecretPath) -> Result<(SecretValue, SecretMetadata), TesseraError>;
-    fn delete(&self, path: &SecretPath) -> Result<(), TesseraError>;
-    /// List immediate key names under `prefix` (mount+path prefix).
-    fn list(&self, prefix: &SecretPath) -> Result<Vec<String>, TesseraError>;
-    fn metadata(&self, path: &SecretPath) -> Result<SecretMetadata, TesseraError>;
+    async fn get(&self, path: &SecretPath) -> Result<Option<Vec<u8>>, TesseraError>;
+    async fn put(&self, path: &SecretPath, blob: Vec<u8>) -> Result<(), TesseraError>;
+    async fn delete(&self, path: &SecretPath) -> Result<(), TesseraError>;
+    /// List immediate key names under `prefix` (mount+path prefix), sorted + deduped.
+    async fn list(&self, prefix: &SecretPath) -> Result<Vec<String>, TesseraError>;
 }
 
-/// In-memory engine for tests and the embed-vs-subprocess-independent path.
-/// `created_time` is injected (no wall-clock in core) so tests are deterministic.
+/// In-memory blob engine for tests and the contract test. No wall-clock, no
+/// version state — opaque bytes only.
+#[derive(Default)]
 pub struct InMemoryEngine {
-    store: Mutex<BTreeMap<String, SecretValue>>,
-    created_time: String,
+    store: Mutex<BTreeMap<String, Vec<u8>>>,
 }
 
 impl InMemoryEngine {
-    pub fn new(created_time: impl Into<String>) -> Self {
-        Self {
-            store: Mutex::new(BTreeMap::new()),
-            created_time: created_time.into(),
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
+#[async_trait::async_trait]
 impl SecretEngine for InMemoryEngine {
-    fn put(&self, path: &SecretPath, value: SecretValue) -> Result<(), TesseraError> {
-        self.store.lock().unwrap().insert(path.scope(), value);
+    async fn get(&self, path: &SecretPath) -> Result<Option<Vec<u8>>, TesseraError> {
+        Ok(self.store.lock().unwrap().get(&path.scope()).cloned())
+    }
+
+    async fn put(&self, path: &SecretPath, blob: Vec<u8>) -> Result<(), TesseraError> {
+        self.store.lock().unwrap().insert(path.scope(), blob);
         Ok(())
     }
-    fn get(&self, path: &SecretPath) -> Result<(SecretValue, SecretMetadata), TesseraError> {
-        let store = self.store.lock().unwrap();
-        let value = store
-            .get(&path.scope())
-            .cloned()
-            .ok_or(TesseraError::NotFound)?;
-        Ok((
-            value,
-            SecretMetadata {
-                current_version: 1,
-                created_time: self.created_time.clone(),
-            },
-        ))
+
+    async fn delete(&self, path: &SecretPath) -> Result<(), TesseraError> {
+        // Idempotent: removing an absent key is not an error at the blob layer.
+        self.store.lock().unwrap().remove(&path.scope());
+        Ok(())
     }
-    fn delete(&self, path: &SecretPath) -> Result<(), TesseraError> {
-        self.store
-            .lock()
-            .unwrap()
-            .remove(&path.scope())
-            .map(|_| ())
-            .ok_or(TesseraError::NotFound)
-    }
-    fn list(&self, prefix: &SecretPath) -> Result<Vec<String>, TesseraError> {
+
+    async fn list(&self, prefix: &SecretPath) -> Result<Vec<String>, TesseraError> {
         let scope_prefix = if prefix.path.is_empty() {
             format!("{}/", prefix.mount)
         } else {
@@ -75,59 +63,68 @@ impl SecretEngine for InMemoryEngine {
         keys.dedup();
         Ok(keys)
     }
-    fn metadata(&self, path: &SecretPath) -> Result<SecretMetadata, TesseraError> {
-        self.get(path).map(|(_, meta)| meta)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn val(k: &str, v: &str) -> SecretValue {
-        let mut m = SecretValue::default();
-        m.0.insert(k.into(), v.into());
-        m
-    }
-
-    #[test]
-    fn put_then_get_roundtrips() {
-        let eng = InMemoryEngine::new("2026-06-14T00:00:00Z");
+    #[tokio::test]
+    async fn put_then_get_roundtrips_blob() {
+        let eng = InMemoryEngine::new();
         let p = SecretPath::new("secret", "galvo/openai");
-        eng.put(&p, val("api_key", "sk-1")).unwrap();
-        let (v, meta) = eng.get(&p).unwrap();
-        assert_eq!(v.0.get("api_key").unwrap(), "sk-1");
-        assert_eq!(meta.current_version, 1);
+        eng.put(&p, b"hello-blob".to_vec()).await.unwrap();
+        let got = eng.get(&p).await.unwrap();
+        assert_eq!(got, Some(b"hello-blob".to_vec()));
     }
 
-    #[test]
-    fn get_missing_is_not_found() {
-        let eng = InMemoryEngine::new("t");
-        assert_eq!(
-            eng.get(&SecretPath::new("secret", "nope")),
-            Err(TesseraError::NotFound)
-        );
+    #[tokio::test]
+    async fn get_missing_is_none() {
+        let eng = InMemoryEngine::new();
+        let got = eng.get(&SecretPath::new("secret", "nope")).await.unwrap();
+        assert_eq!(got, None);
     }
 
-    #[test]
-    fn list_returns_immediate_names_under_prefix() {
-        let eng = InMemoryEngine::new("t");
-        eng.put(&SecretPath::new("secret", "galvo/openai"), val("k", "1"))
+    #[tokio::test]
+    async fn put_overwrites_blob() {
+        let eng = InMemoryEngine::new();
+        let p = SecretPath::new("secret", "galvo/openai");
+        eng.put(&p, b"v1".to_vec()).await.unwrap();
+        eng.put(&p, b"v2".to_vec()).await.unwrap();
+        assert_eq!(eng.get(&p).await.unwrap(), Some(b"v2".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn delete_removes_then_none() {
+        let eng = InMemoryEngine::new();
+        let p = SecretPath::new("secret", "galvo/openai");
+        eng.put(&p, b"x".to_vec()).await.unwrap();
+        eng.delete(&p).await.unwrap();
+        assert_eq!(eng.get(&p).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn delete_missing_is_ok() {
+        // Blob delete is idempotent; "missing-ness" is the store layer's concern now.
+        let eng = InMemoryEngine::new();
+        eng.delete(&SecretPath::new("secret", "nope"))
+            .await
             .unwrap();
-        eng.put(&SecretPath::new("secret", "galvo/anthropic"), val("k", "2"))
+    }
+
+    #[tokio::test]
+    async fn list_returns_immediate_names_under_prefix() {
+        let eng = InMemoryEngine::new();
+        eng.put(&SecretPath::new("secret", "galvo/openai"), b"1".to_vec())
+            .await
             .unwrap();
-        eng.put(&SecretPath::new("secret", "femto/key"), val("k", "3"))
+        eng.put(&SecretPath::new("secret", "galvo/anthropic"), b"2".to_vec())
+            .await
             .unwrap();
-        let keys = eng.list(&SecretPath::new("secret", "galvo")).unwrap();
+        eng.put(&SecretPath::new("secret", "femto/key"), b"3".to_vec())
+            .await
+            .unwrap();
+        let keys = eng.list(&SecretPath::new("secret", "galvo")).await.unwrap();
         assert_eq!(keys, vec!["anthropic".to_string(), "openai".to_string()]);
-    }
-
-    #[test]
-    fn delete_removes_then_missing() {
-        let eng = InMemoryEngine::new("t");
-        let p = SecretPath::new("secret", "galvo/openai");
-        eng.put(&p, val("k", "1")).unwrap();
-        eng.delete(&p).unwrap();
-        assert_eq!(eng.delete(&p), Err(TesseraError::NotFound));
     }
 }
