@@ -9,6 +9,15 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 blake3 = { workspace = true }
+# async, object-safe SecretEngine: async-trait boxes the returned futures so the
+# trait stays object-safe (Arc<dyn SecretEngine>).
+async-trait = "0.1"
+# Seal-file crypto for the encrypted RustyVault unseal sidecar (Phase 3):
+# AES-256-GCM with the key = SHA-256(master_key). Pure-Rust RustCrypto crates
+# (NIST suite — never ShangMi/SM), kept as direct deps so they don't couple to
+# whatever crypto rusty_vault transitively exposes.
+aes-gcm = "0.10"
+sha2 = "0.10"
 # RustyVault embedded engine (Task 9). `crypto_adaptor_openssl` pins the vanilla
 # crates.io OpenSSL backend; `crypto_adaptor_tongsuo` (ShangMi/SM, 国密) is the
 # mutually-exclusive alternative and is NEVER enabled. `default-features = false`
@@ -16,6 +25,7 @@ blake3 = { workspace = true }
 # Pinned to the crates.io 0.2.1 release (NOT a git dep on main, whose workspace
 # root activates a Tongsuo openssl [patch.crates-io]). See docs/spike-rustyvault.md.
 rusty_vault = { version = "0.2.1", default-features = false, features = ["crypto_adaptor_openssl"] }
-# Sync->async bridge: a dedicated current-thread runtime drives Core::handle_request
-# (async) from the sync SecretEngine methods. `rt` only; no multi-thread needed.
-tokio = { version = "1", default-features = false, features = ["rt"] }
+# Async engine: Core::handle_request is awaited directly (no nested runtime).
+# `rt-multi-thread` + `macros` enable `#[tokio::test]`; `sync` enables
+# tokio::sync::{RwLock, Mutex} (the async-aware Core guard + per-path RMW lock).
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "macros", "sync"] }
