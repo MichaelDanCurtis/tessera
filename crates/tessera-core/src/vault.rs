@@ -11,7 +11,7 @@ use crate::auth::TokenStore;
 use crate::clock::Clock;
 use crate::engine::SecretEngine;
 use crate::seal::SealState;
-use crate::types::{SecretPath, TesseraError, VersionedSecret};
+use crate::types::{SecretPath, SecretValue, TesseraError, Version, VersionMeta, VersionedSecret};
 
 pub struct VaultStore {
     engine: Arc<dyn SecretEngine>,
@@ -102,6 +102,123 @@ impl VaultStore {
             .map_err(|e| TesseraError::Storage(format!("encode VersionedSecret: {e}")))?;
         self.engine.put(path, blob).await
     }
+
+    pub async fn write(
+        &self,
+        token: &str,
+        path: &SecretPath,
+        value: SecretValue,
+        cas: Option<u32>,
+    ) -> Result<u32, TesseraError> {
+        self.guard(token, path)?;
+        let lock = self.path_lock(path);
+        let _g = lock.lock().await;
+
+        let now = self.clock.now_rfc3339();
+        let mut vs = self
+            .load(path)
+            .await?
+            .unwrap_or_else(|| VersionedSecret::empty(now.clone()));
+
+        // CAS gate (per spec §5).
+        let effective_cas = if vs.cas_required {
+            cas.or(Some(u32::MAX))
+        } else {
+            cas
+        };
+        if let Some(want) = effective_cas {
+            if want != vs.current_version {
+                // includes: cas_required bare-write (want=MAX), stale, cas=0 on existing
+                self.record(AuditOp::Write, path, token, false);
+                return Err(TesseraError::CasMismatch);
+            }
+        }
+
+        let new_version = vs.current_version + 1;
+        vs.versions.insert(
+            new_version,
+            Version {
+                data: Some(value),
+                created_time: now.clone(),
+                deletion_time: None,
+                destroyed: false,
+            },
+        );
+        vs.current_version = new_version;
+        if vs.oldest_version == 0 {
+            vs.oldest_version = new_version;
+        }
+        vs.updated_time = now;
+
+        // Trim: drop data of versions older than the max_versions window.
+        while vs.current_version - vs.oldest_version + 1 > vs.max_versions {
+            if let Some(v) = vs.versions.get_mut(&vs.oldest_version) {
+                v.data = None;
+            }
+            vs.oldest_version += 1;
+        }
+
+        self.save(path, &vs).await?;
+        self.record(AuditOp::Write, path, token, true);
+        Ok(new_version)
+    }
+
+    pub async fn read(
+        &self,
+        token: &str,
+        path: &SecretPath,
+        version: Option<u32>,
+    ) -> Result<(Option<SecretValue>, VersionMeta), TesseraError> {
+        self.guard(token, path)?;
+        let vs = match self.load(path).await? {
+            Some(vs) if vs.current_version > 0 => vs,
+            _ => {
+                self.record(AuditOp::Read, path, token, false);
+                return Err(TesseraError::NotFound);
+            }
+        };
+        let n = version.unwrap_or(vs.current_version);
+        let ver = match vs.versions.get(&n) {
+            Some(v) => v,
+            None => {
+                self.record(AuditOp::Read, path, token, false);
+                return Err(TesseraError::NotFound);
+            }
+        };
+        // Soft-deleted or destroyed => no value (null data), metadata still returned.
+        let value = if ver.deletion_time.is_some() || ver.destroyed {
+            None
+        } else {
+            ver.data.clone()
+        };
+        let meta = VersionMeta {
+            version: n,
+            created_time: ver.created_time.clone(),
+            deletion_time: ver.deletion_time.clone(),
+            destroyed: ver.destroyed,
+        };
+        self.record(AuditOp::Read, path, token, true);
+        Ok((value, meta))
+    }
+
+    // --- stubs filled in Task 7 (declared now so the crate compiles) ---
+    pub async fn read_metadata(
+        &self,
+        _token: &str,
+        _path: &SecretPath,
+    ) -> Result<VersionedSecret, TesseraError> {
+        todo!("Task 7")
+    }
+
+    pub async fn configure_metadata(
+        &self,
+        _token: &str,
+        _path: &SecretPath,
+        _max_versions: Option<u32>,
+        _cas_required: Option<bool>,
+    ) -> Result<(), TesseraError> {
+        todo!("Task 7")
+    }
 }
 
 #[cfg(test)]
@@ -153,5 +270,130 @@ mod tests {
         let s = store();
         let p = SecretPath::new("secret", "galvo/openai");
         assert_eq!(s.guard("nope", &p), Err(TesseraError::InvalidToken));
+    }
+
+    fn val(v: &str) -> SecretValue {
+        let mut m = SecretValue::default();
+        m.0.insert("api_key".into(), v.into());
+        m
+    }
+
+    #[tokio::test]
+    async fn write_increments_versions_read_current_and_pinned() {
+        let s = store();
+        let p = SecretPath::new("secret", "galvo/openai");
+        assert_eq!(s.write("galvo-tok", &p, val("v1"), None).await.unwrap(), 1);
+        assert_eq!(s.write("galvo-tok", &p, val("v2"), None).await.unwrap(), 2);
+
+        // current
+        let (cur, meta) = s.read("galvo-tok", &p, None).await.unwrap();
+        assert_eq!(cur.unwrap().0.get("api_key").unwrap(), "v2");
+        assert_eq!(meta.version, 2);
+
+        // pinned older
+        let (old, m1) = s.read("galvo-tok", &p, Some(1)).await.unwrap();
+        assert_eq!(old.unwrap().0.get("api_key").unwrap(), "v1");
+        assert_eq!(m1.version, 1);
+    }
+
+    #[tokio::test]
+    async fn read_missing_secret_is_not_found() {
+        let s = store();
+        let p = SecretPath::new("secret", "galvo/nope");
+        assert_eq!(
+            s.read("galvo-tok", &p, None).await.unwrap_err(),
+            TesseraError::NotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn read_missing_version_is_not_found() {
+        let s = store();
+        let p = SecretPath::new("secret", "galvo/openai");
+        s.write("galvo-tok", &p, val("v1"), None).await.unwrap();
+        assert_eq!(
+            s.read("galvo-tok", &p, Some(99)).await.unwrap_err(),
+            TesseraError::NotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn cas_correct_advances_stale_rejected() {
+        let s = store();
+        let p = SecretPath::new("secret", "galvo/openai");
+        // cas=0 = create-only, succeeds on empty
+        assert_eq!(
+            s.write("galvo-tok", &p, val("v1"), Some(0)).await.unwrap(),
+            1
+        );
+        // cas=1 matches current, advances
+        assert_eq!(
+            s.write("galvo-tok", &p, val("v2"), Some(1)).await.unwrap(),
+            2
+        );
+        // stale cas=1 (current is 2) rejected, no new version
+        assert_eq!(
+            s.write("galvo-tok", &p, val("v3"), Some(1))
+                .await
+                .unwrap_err(),
+            TesseraError::CasMismatch
+        );
+        // current still v2
+        let (cur, meta) = s.read("galvo-tok", &p, None).await.unwrap();
+        assert_eq!(cur.unwrap().0.get("api_key").unwrap(), "v2");
+        assert_eq!(meta.version, 2);
+    }
+
+    #[tokio::test]
+    async fn cas_zero_on_existing_is_mismatch() {
+        let s = store();
+        let p = SecretPath::new("secret", "galvo/openai");
+        s.write("galvo-tok", &p, val("v1"), None).await.unwrap();
+        assert_eq!(
+            s.write("galvo-tok", &p, val("dup"), Some(0))
+                .await
+                .unwrap_err(),
+            TesseraError::CasMismatch
+        );
+    }
+
+    #[tokio::test]
+    async fn cas_required_blocks_bare_write() {
+        let s = store();
+        let p = SecretPath::new("secret", "galvo/openai");
+        s.write("galvo-tok", &p, val("v1"), None).await.unwrap();
+        s.configure_metadata("galvo-tok", &p, None, Some(true))
+            .await
+            .unwrap();
+        // bare write (no cas) now rejected
+        assert_eq!(
+            s.write("galvo-tok", &p, val("v2"), None).await.unwrap_err(),
+            TesseraError::CasMismatch
+        );
+        // with correct cas it works
+        assert_eq!(
+            s.write("galvo-tok", &p, val("v2"), Some(1)).await.unwrap(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn max_versions_trims_oldest_data() {
+        let s = store();
+        let p = SecretPath::new("secret", "galvo/openai");
+        s.write("galvo-tok", &p, val("v1"), None).await.unwrap();
+        s.configure_metadata("galvo-tok", &p, Some(2), None)
+            .await
+            .unwrap();
+        s.write("galvo-tok", &p, val("v2"), None).await.unwrap();
+        s.write("galvo-tok", &p, val("v3"), None).await.unwrap(); // trims v1 data
+                                                                  // v1 data dropped (reads as null), v2 + v3 retained
+        let (v1, _) = s.read("galvo-tok", &p, Some(1)).await.unwrap();
+        assert!(v1.is_none());
+        let (v3, _) = s.read("galvo-tok", &p, None).await.unwrap();
+        assert_eq!(v3.unwrap().0.get("api_key").unwrap(), "v3");
+        let md = s.read_metadata("galvo-tok", &p).await.unwrap();
+        assert_eq!(md.oldest_version, 2);
+        assert_eq!(md.current_version, 3);
     }
 }
