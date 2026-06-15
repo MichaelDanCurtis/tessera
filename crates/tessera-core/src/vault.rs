@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::audit::{token_hash, AuditOp, AuditRecord, AuditSink};
-use crate::auth::TokenStore;
+use crate::auth::{PolicyStore, TokenStore};
 use crate::clock::Clock;
 use crate::engine::SecretEngine;
 use crate::seal::SealState;
@@ -20,6 +20,7 @@ pub struct VaultStore {
     engine: Arc<dyn SecretEngine>,
     seal: SealState,
     tokens: TokenStore,
+    policies: Arc<PolicyStore>,
     audit: Arc<dyn AuditSink>,
     clock: Arc<dyn Clock>,
     /// Per-path async locks keyed by `path.scope()`, guarding each RMW so version
@@ -32,6 +33,7 @@ impl VaultStore {
         engine: Arc<dyn SecretEngine>,
         seal: SealState,
         tokens: TokenStore,
+        policies: Arc<PolicyStore>,
         audit: Arc<dyn AuditSink>,
         clock: Arc<dyn Clock>,
     ) -> Self {
@@ -39,6 +41,7 @@ impl VaultStore {
             engine,
             seal,
             tokens,
+            policies,
             audit,
             clock,
             locks: Mutex::new(HashMap::new()),
@@ -53,16 +56,31 @@ impl VaultStore {
         &self.audit
     }
 
+    pub fn policies(&self) -> &Arc<PolicyStore> {
+        &self.policies
+    }
+
+    pub fn tokens(&self) -> &TokenStore {
+        &self.tokens
+    }
+
+    pub fn clock(&self) -> &Arc<dyn Clock> {
+        &self.clock
+    }
+
     /// Seal + auth gate. On auth failure, records an `AuthFailure` audit entry and
     /// returns the error (fail-closed, before any engine touch).
     fn guard(&self, token: &str, path: &SecretPath) -> Result<(), TesseraError> {
         self.seal.require_unsealed()?;
-        if let Err(e) = self.tokens.authorize(token, path) {
+        let now = self.clock.now_rfc3339();
+        if let Err(e) = self.tokens.authorize_at(token, path, &self.policies, &now) {
             self.audit.append(AuditRecord {
                 op: AuditOp::AuthFailure,
                 scope: path.scope(),
                 token_hash: token_hash(token),
                 outcome: false,
+                timestamp: self.clock.now_rfc3339(),
+                reveal: false,
             });
             return Err(e);
         }
@@ -70,11 +88,29 @@ impl VaultStore {
     }
 
     fn record(&self, op: AuditOp, path: &SecretPath, token: &str, outcome: bool) {
+        self.record_inner(op, path, token, outcome, false);
+    }
+
+    /// Like `record`, but flags the entry as a reveal (operator saw plaintext).
+    fn record_reveal(&self, path: &SecretPath, token: &str, outcome: bool) {
+        self.record_inner(AuditOp::Read, path, token, outcome, true);
+    }
+
+    fn record_inner(
+        &self,
+        op: AuditOp,
+        path: &SecretPath,
+        token: &str,
+        outcome: bool,
+        reveal: bool,
+    ) {
         self.audit.append(AuditRecord {
             op,
             scope: path.scope(),
             token_hash: token_hash(token),
             outcome,
+            timestamp: self.clock.now_rfc3339(),
+            reveal,
         });
     }
 
@@ -208,6 +244,45 @@ impl VaultStore {
             destroyed: ver.destroyed,
         };
         self.record(AuditOp::Read, path, token, true);
+        Ok((value, meta))
+    }
+
+    /// Like `read`, but records the audit entry as a REVEAL (operator saw the
+    /// plaintext via the console). Returns the same value/metadata as `read`.
+    pub async fn read_reveal(
+        &self,
+        token: &str,
+        path: &SecretPath,
+        version: Option<u32>,
+    ) -> Result<(Option<SecretValue>, VersionMeta), TesseraError> {
+        self.guard(token, path)?;
+        let vs = match self.load(path).await? {
+            Some(vs) if vs.current_version > 0 => vs,
+            _ => {
+                self.record_reveal(path, token, false);
+                return Err(TesseraError::NotFound);
+            }
+        };
+        let n = version.unwrap_or(vs.current_version);
+        let ver = match vs.versions.get(&n) {
+            Some(v) => v,
+            None => {
+                self.record_reveal(path, token, false);
+                return Err(TesseraError::NotFound);
+            }
+        };
+        let value = if ver.deletion_time.is_some() || ver.destroyed {
+            None
+        } else {
+            ver.data.clone()
+        };
+        let meta = VersionMeta {
+            version: n,
+            created_time: ver.created_time.clone(),
+            deletion_time: ver.deletion_time.clone(),
+            destroyed: ver.destroyed,
+        };
+        self.record_reveal(path, token, true);
         Ok((value, meta))
     }
 
@@ -379,7 +454,7 @@ impl VaultStore {
 mod tests {
     use super::*;
     use crate::audit::InMemoryAudit;
-    use crate::auth::Policy;
+    use crate::auth::{Policy, PolicyStore};
     use crate::clock::FixedClock;
     use crate::engine::InMemoryEngine;
 
@@ -392,6 +467,7 @@ mod tests {
             Arc::new(InMemoryEngine::new()),
             seal,
             tokens,
+            Arc::new(PolicyStore::in_memory()),
             Arc::new(InMemoryAudit::new()),
             Arc::new(FixedClock("2026-06-14T00:00:00Z".into())),
         )
@@ -443,6 +519,7 @@ mod tests {
             engine,
             seal,
             tokens,
+            Arc::new(PolicyStore::in_memory()),
             Arc::new(InMemoryAudit::new()),
             Arc::new(FixedClock("2026-06-14T00:00:00Z".into())),
         )
@@ -711,6 +788,64 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(keys, vec!["anthropic".to_string(), "openai".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn read_reveal_marks_audit_entry() {
+        let s = store();
+        let p = SecretPath::new("secret", "galvo/openai");
+        s.write("galvo-tok", &p, val("v1"), None).await.unwrap();
+        let (v, _m) = s.read_reveal("galvo-tok", &p, None).await.unwrap();
+        assert_eq!(v.unwrap().0.get("api_key").unwrap(), "v1");
+        let last = s.audit_sink().records().into_iter().last().unwrap();
+        assert_eq!(last.op, AuditOp::Read);
+        assert!(last.reveal, "reveal read must flag the audit entry");
+    }
+
+    /// REGRESSION (Critical fail-open): an expired dynamic token must be denied
+    /// on the REAL data-plane guard path (`write`/`read`), not just when calling
+    /// `authorize_at` directly. Build the store's clock PAST the token's expiry
+    /// and assert the op is rejected as `InvalidToken`.
+    #[tokio::test]
+    async fn expired_dynamic_token_denied_through_guard() {
+        // Named policy the issued token references (issue() validates the name).
+        let policies = Arc::new(PolicyStore::in_memory());
+        policies
+            .put("galvo", Policy::new(["secret/galvo/"]))
+            .unwrap();
+
+        // Issue a dynamic token at a base instant with a 60s TTL =>
+        // expires ~ 2026-06-14T00:01:00Z.
+        let tokens = TokenStore::new();
+        let issued = tokens
+            .issue(
+                vec!["galvo".into()],
+                Some(60),
+                "2026-06-14T00:00:00Z",
+                &policies,
+            )
+            .unwrap();
+
+        // Build the store's clock at a LATER instant (token already expired).
+        let seal = SealState::new(b"m".to_vec());
+        seal.unseal(b"m").unwrap();
+        let s = VaultStore::new(
+            Arc::new(InMemoryEngine::new()),
+            seal,
+            tokens,
+            policies,
+            Arc::new(InMemoryAudit::new()),
+            Arc::new(FixedClock("2026-06-14T01:00:00Z".into())),
+        );
+
+        let p = SecretPath::new("secret", "galvo/openai");
+        // A write through the data-plane guard MUST be denied (expired token).
+        assert_eq!(
+            s.write(&issued.token, &p, val("nope"), None)
+                .await
+                .unwrap_err(),
+            TesseraError::InvalidToken
+        );
     }
 
     #[tokio::test]

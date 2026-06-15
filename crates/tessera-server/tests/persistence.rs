@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use tessera_core::audit::InMemoryAudit;
-use tessera_core::auth::{Policy, TokenStore};
+use tessera_core::auth::{Policy, PolicyStore, TokenStore};
 use tessera_core::clock::SystemClock;
 use tessera_core::rusty_engine::RustyVaultEngine;
 use tessera_core::seal::SealState;
@@ -33,6 +33,7 @@ async fn open_store(data_dir: &str) -> VaultStore {
         Arc::new(engine),
         seal,
         tokens,
+        Arc::new(PolicyStore::in_memory()),
         Arc::new(InMemoryAudit::new()),
         Arc::new(SystemClock),
     )

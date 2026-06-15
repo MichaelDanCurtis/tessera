@@ -4,6 +4,7 @@ pub struct Config {
     pub master_key: Vec<u8>,
     pub data_dir: String,
     pub crypto_backend: String,
+    pub admin_token: Option<String>,
 }
 
 // Manual Debug that REDACTS the master key. `Config` needs `Debug` for tests'
@@ -15,6 +16,10 @@ impl std::fmt::Debug for Config {
             .field("master_key", &"<redacted>")
             .field("data_dir", &self.data_dir)
             .field("crypto_backend", &self.crypto_backend)
+            .field(
+                "admin_token",
+                &self.admin_token.as_ref().map(|_| "<redacted>"),
+            )
             .finish()
     }
 }
@@ -41,11 +46,13 @@ pub fn from_getter(get: impl Fn(&str) -> Option<String>) -> Result<Config, Confi
         .ok_or(ConfigError::MissingMasterKey)?;
     let crypto_backend = get("TESSERA_CRYPTO_BACKEND").unwrap_or_else(|| "openssl".to_string());
     validate_crypto(&crypto_backend)?;
+    let admin_token = get("TESSERA_ADMIN_TOKEN").filter(|s| !s.is_empty());
     Ok(Config {
         bind: get("TESSERA_BIND").unwrap_or_else(|| "127.0.0.1:8200".to_string()),
         master_key: master_key.into_bytes(),
         data_dir: get("TESSERA_DATA_DIR").unwrap_or_else(|| "./data".to_string()),
         crypto_backend,
+        admin_token,
     })
 }
 
@@ -100,6 +107,21 @@ mod tests {
         let cfg = from_getter(getter(&[("TESSERA_MASTER_KEY", "k")])).unwrap();
         assert_eq!(cfg.bind, "127.0.0.1:8200");
         assert_eq!(cfg.crypto_backend, "openssl");
+    }
+
+    #[test]
+    fn admin_token_optional_and_redacted() {
+        let cfg = from_getter(getter(&[
+            ("TESSERA_MASTER_KEY", "k"),
+            ("TESSERA_ADMIN_TOKEN", "admin-secret-xyz"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.admin_token.as_deref(), Some("admin-secret-xyz"));
+        let rendered = format!("{cfg:?}");
+        assert!(
+            !rendered.contains("admin-secret-xyz"),
+            "admin token must be redacted in Debug"
+        );
     }
 
     #[test]

@@ -110,7 +110,13 @@ async fn read(
     let token = token_of(&headers);
     let sp = SecretPath::new(mount, path);
     let version = q.get("version").and_then(|v| v.parse::<u32>().ok());
-    match state.vault.read(&token, &sp, version).await {
+    let reveal = q.get("reveal").map(String::as_str) == Some("true");
+    let result = if reveal {
+        state.vault.read_reveal(&token, &sp, version).await
+    } else {
+        state.vault.read(&token, &sp, version).await
+    };
+    match result {
         Ok((value, meta)) => {
             let data: Value = match value {
                 Some(v) => json!(v.0),
@@ -304,7 +310,7 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use std::sync::Arc;
     use tessera_core::audit::InMemoryAudit;
-    use tessera_core::auth::{Policy, TokenStore};
+    use tessera_core::auth::{Policy, PolicyStore, TokenStore};
     use tessera_core::clock::FixedClock;
     use tessera_core::engine::InMemoryEngine;
     use tessera_core::seal::SealState;
@@ -320,6 +326,7 @@ mod tests {
             Arc::new(InMemoryEngine::new()),
             seal,
             tokens,
+            Arc::new(PolicyStore::in_memory()),
             Arc::new(InMemoryAudit::new()),
             Arc::new(FixedClock("2026-06-14T00:00:00Z".into())),
         );
@@ -538,5 +545,30 @@ mod tests {
         let app = router(state());
         let r = app.oneshot(get("/v1/secret/data/femto/key")).await.unwrap();
         assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn data_read_with_reveal_param_marks_audit_reveal() {
+        let st = state();
+        let app = router(st.clone());
+        // seed a secret
+        app.clone()
+            .oneshot(post(
+                "/v1/secret/data/galvo/openai",
+                r#"{"data":{"api_key":"sk-1"}}"#,
+            ))
+            .await
+            .unwrap();
+        let res = app
+            .oneshot(get("/v1/secret/data/galvo/openai?reveal=true"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        // the most recent audit entry is a reveal-flagged Read
+        let recs = st.vault.audit_sink().records();
+        assert!(
+            recs.last().unwrap().reveal,
+            "reveal=true must produce a reveal-flagged audit entry"
+        );
     }
 }
