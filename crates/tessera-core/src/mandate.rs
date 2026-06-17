@@ -241,15 +241,22 @@ pub fn check_binding_issue(mandate: &Value, req: &RequestBinding) -> Result<(), 
         .as_deref()
         .filter(|s| !s.is_empty())
         .ok_or_else(|| MandateError::PolicyDenied("request spiffeId missing".into()))?;
-    // `starts_with(subject)` already covers exact-equality and `/`-extension
-    // (P1-loose per §3.5; deepened to structured cell-eligibility in P3).
-    if spiffe.starts_with(subject) {
+    // Exact match or a true `/`-delimited path extension — a bare prefix
+    // (`{subject}-attacker`) must NOT pass (P1 binding; deepened to structured
+    // cell-eligibility in P3).
+    if spiffe_within_subject(spiffe, subject) {
         Ok(())
     } else {
         Err(MandateError::PolicyDenied(format!(
             "requested spiffeId {spiffe} not within mandate subject {subject}"
         )))
     }
+}
+
+/// A request SPIFFE id is "within" a mandate subject only on exact match or a
+/// genuine `/`-delimited path extension — never on a bare string prefix.
+fn spiffe_within_subject(spiffe: &str, subject: &str) -> bool {
+    spiffe == subject || spiffe.starts_with(&format!("{subject}/"))
 }
 
 /// §3.5.5 binding for the unwrap route: if context.spiffeId is present it must
@@ -260,7 +267,7 @@ pub fn check_binding_unwrap(mandate: &Value, req: &RequestBinding) -> Result<(),
     match req.spiffe_id.as_deref().filter(|s| !s.is_empty()) {
         None => Ok(()),
         Some(spiffe) => {
-            if spiffe.starts_with(subject) {
+            if spiffe_within_subject(spiffe, subject) {
                 Ok(())
             } else {
                 Err(MandateError::PolicyDenied(format!(
@@ -626,6 +633,22 @@ mod claim_tests {
             check_binding_issue(&v, &bad),
             Err(MandateError::PolicyDenied(_))
         ));
+        // bare-prefix bypass (subject + non-`/` suffix) MUST be denied — a
+        // `starts_with(subject)` check would wrongly accept this.
+        let prefix_attack = RequestBinding {
+            spiffe_id: Some("spiffe://femto.local/run-attacker".into()),
+            trust_domain: Some("femto.local".into()),
+        };
+        assert!(matches!(
+            check_binding_issue(&v, &prefix_attack),
+            Err(MandateError::PolicyDenied(_))
+        ));
+        // exact-match subject is allowed
+        let exact = RequestBinding {
+            spiffe_id: Some("spiffe://femto.local/run".into()),
+            trust_domain: Some("femto.local".into()),
+        };
+        assert!(check_binding_issue(&v, &exact).is_ok());
     }
 
     #[test]
