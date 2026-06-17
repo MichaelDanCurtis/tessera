@@ -12,6 +12,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tessera_core::audit::AuditOp;
+use tessera_core::mandate::{
+    verify_mandate, MandateError, MandateOutcome, RequestBinding, TrustRoute,
+};
 use tessera_core::types::{SecretPath, TesseraError};
 
 use crate::app::AppState;
@@ -36,6 +39,8 @@ struct GalvoFsUnwrapRequest {
     unwrap_profile: String,
     #[serde(default)]
     context: Value,
+    #[serde(default)]
+    mandate: Option<Value>,
 }
 
 pub fn routes() -> Router<AppState> {
@@ -69,6 +74,19 @@ fn bad_request(msg: impl Into<String>) -> (StatusCode, Json<Value>) {
     (
         StatusCode::BAD_REQUEST,
         Json(json!({ "errors": [msg.into()] })),
+    )
+}
+
+/// Map a mandate verification failure to its A2E HTTP status + `code` body.
+/// mandate-invalid -> 400; mandate-unverifiable / policy-denied -> 403.
+fn mandate_err_response(err: &MandateError) -> (StatusCode, Json<Value>) {
+    let status = match err {
+        MandateError::Invalid(_) => StatusCode::BAD_REQUEST,
+        MandateError::Unverifiable(_) | MandateError::PolicyDenied(_) => StatusCode::FORBIDDEN,
+    };
+    (
+        status,
+        Json(json!({ "errors": [err.to_string()], "code": err.code() })),
     )
 }
 
@@ -150,6 +168,27 @@ async fn unwrap_galvofs(
         return err_response(e).into_response();
     }
 
+    // Mandate verification (trust-plane §3.5) — after auth, before unwrap.
+    let now = state.vault.clock().now_rfc3339();
+    let binding = RequestBinding::from_unwrap_context(&req.context);
+    let claims = match verify_mandate(
+        req.mandate.as_ref(),
+        TrustRoute::Unwrap,
+        &binding,
+        state.trust.anchors.view(),
+        &state.trust.verify,
+        &now,
+    ) {
+        Ok(MandateOutcome::Verified(c)) => Some(c),
+        Ok(MandateOutcome::SkippedDev) => None,
+        Err(e) => {
+            state
+                .vault
+                .record_action(AuditOp::TransitUnwrap, &scope, &token, false);
+            return mandate_err_response(&e).into_response();
+        }
+    };
+
     let ciphertext = match STANDARD.decode(&req.ciphertext_base64) {
         Ok(bytes) => bytes,
         Err(_) => {
@@ -201,9 +240,16 @@ async fn unwrap_galvofs(
 
     let plaintext_digest = sha256_digest(&plaintext);
     let decision_id = unwrap_decision_id(&req, &plaintext_digest);
+    let audit_scope = match &claims {
+        Some(c) => SecretPath::new(
+            scope.mount.clone(),
+            format!("{}|mandate={}|keyId={}", scope.path, c.mandate_id, c.key_id),
+        ),
+        None => scope.clone(),
+    };
     state
         .vault
-        .record_action(AuditOp::TransitUnwrap, &scope, &token, true);
+        .record_action(AuditOp::TransitUnwrap, &audit_scope, &token, true);
 
     (
         StatusCode::OK,

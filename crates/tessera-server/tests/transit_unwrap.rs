@@ -8,15 +8,62 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
+use ed25519_dalek::{Signer, SigningKey};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tessera_core::audit::{AuditOp, InMemoryAudit};
 use tessera_core::auth::{Policy, PolicyStore, TokenStore};
 use tessera_core::clock::FixedClock;
 use tessera_core::engine::InMemoryEngine;
+use tessera_core::mandate::{canonical_signing_payload, VerifyConfig};
 use tessera_core::seal::SealState;
+use tessera_core::trust_anchors::TrustAnchors;
 use tessera_core::vault::VaultStore;
 use tessera_server::app::{router, AppState, TrustConfig};
+
+const FIXTURE_SEED: [u8; 32] = [0x11; 32];
+const FIXTURE_KEY_ID: &str = "arc-fixture-key-1";
+
+fn fixture_anchor_spec() -> String {
+    let pk = STANDARD.encode(
+        SigningKey::from_bytes(&FIXTURE_SEED)
+            .verifying_key()
+            .to_bytes(),
+    );
+    format!("{FIXTURE_KEY_ID}:{pk}")
+}
+
+fn signed_unwrap_mandate(subject: &str, audience: &str) -> Value {
+    let mut m = json!({
+        "mandateId": "m-transit-1",
+        "format": "a2e-execution-mandate/v0",
+        "issuer": "galvo-arc",
+        "subject": subject,
+        "audience": audience,
+        "issuedAt": "2026-06-14T00:00:00Z",
+        "expiresAt": "2999-01-01T00:00:00Z",
+        "certifies": { "action": "execute", "workOrderHash": "sha256:beef", "idempotencyKey": "i-1" },
+        "scope": { "data": [], "models": [], "runtimeClasses": ["wasm"] },
+        "signature": { "alg": "ed25519", "value": "", "keyId": FIXTURE_KEY_ID }
+    });
+    let payload = canonical_signing_payload(&m);
+    let sig = SigningKey::from_bytes(&FIXTURE_SEED).sign(&payload);
+    m["signature"]["value"] = Value::String(STANDARD.encode(sig.to_bytes()));
+    m
+}
+
+/// State enforcing mandates in prod mode against the fixture anchor.
+fn transit_state_enforcing() -> AppState {
+    let mut state = transit_state();
+    state.trust = TrustConfig {
+        anchors: Arc::new(TrustAnchors::from_str_spec(&fixture_anchor_spec()).unwrap()),
+        verify: VerifyConfig {
+            audience: "tessera.local".into(),
+            allow_unsigned_dev: false,
+        },
+    };
+    state
+}
 
 fn transit_state() -> AppState {
     let mut tokens = TokenStore::new();
@@ -191,4 +238,99 @@ async fn unwrap_rejects_ciphertext_digest_mismatch() {
     assert!(audit.iter().any(|r| {
         r.op == AuditOp::TransitUnwrap && r.scope == "transit/unwrap/galvofs" && !r.outcome
     }));
+}
+
+#[tokio::test]
+async fn unwrap_with_valid_signed_mandate_succeeds() {
+    let state = transit_state_enforcing();
+    let base = serve(state.clone()).await;
+    let client = reqwest::Client::new();
+    let key_ref = "tessera://transit/galvofs/real-secure-capsule";
+    let nonce = [0x42; 12];
+    let plaintext = br#"{"sealed":true,"opened":"tessera"}"#;
+    let ciphertext = seal_fixture(key_ref, &nonce, plaintext);
+    let subject = "spiffe://femto.local/run";
+    let mandate = signed_unwrap_mandate(subject, "tessera.local");
+
+    let res = client
+        .post(format!("{base}/v1/transit/unwrap/galvofs"))
+        .header("Authorization", "Bearer unwrap-tok")
+        .json(&json!({
+            "keyRef": key_ref,
+            "cipherSuite": "aes-256-gcm",
+            "nonce": "hex:424242424242424242424242",
+            "ciphertextBase64": STANDARD.encode(&ciphertext),
+            "ciphertextDigest": sha256_digest(&ciphertext),
+            "unwrapProfile": "galvofs-destructive-boot-v0",
+            "context": { "spiffeId": "spiffe://femto.local/run/run-1" },
+            "mandate": mandate
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+
+    let audit = state.vault.audit_sink().records();
+    assert!(audit.iter().any(|r| r.op == AuditOp::TransitUnwrap
+        && r.scope.contains("mandate=m-transit-1")
+        && r.outcome));
+}
+
+#[tokio::test]
+async fn unwrap_missing_mandate_in_prod_is_rejected() {
+    let state = transit_state_enforcing();
+    let base = serve(state.clone()).await;
+    let client = reqwest::Client::new();
+    let res = client
+        .post(format!("{base}/v1/transit/unwrap/galvofs"))
+        .header("Authorization", "Bearer unwrap-tok")
+        .json(&json!({
+            "keyRef": "tessera://transit/galvofs/real-secure-capsule",
+            "cipherSuite": "aes-256-gcm",
+            "nonce": "hex:424242424242424242424242",
+            "ciphertextBase64": "AA==",
+            "ciphertextDigest": "sha256:bad",
+            "unwrapProfile": "galvofs-destructive-boot-v0",
+            "context": {}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 400);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["code"], "mandate-invalid");
+}
+
+#[tokio::test]
+async fn unwrap_audience_mismatch_is_policy_denied() {
+    let state = transit_state_enforcing();
+    let base = serve(state.clone()).await;
+    let client = reqwest::Client::new();
+    let key_ref = "tessera://transit/galvofs/real-secure-capsule";
+    let nonce = [0x42; 12];
+    let plaintext = br#"{"sealed":true}"#;
+    let ciphertext = seal_fixture(key_ref, &nonce, plaintext);
+    let subject = "spiffe://femto.local/run";
+    // Signed mandate carries the WRONG audience.
+    let mandate = signed_unwrap_mandate(subject, "other");
+
+    let res = client
+        .post(format!("{base}/v1/transit/unwrap/galvofs"))
+        .header("Authorization", "Bearer unwrap-tok")
+        .json(&json!({
+            "keyRef": key_ref,
+            "cipherSuite": "aes-256-gcm",
+            "nonce": "hex:424242424242424242424242",
+            "ciphertextBase64": STANDARD.encode(&ciphertext),
+            "ciphertextDigest": sha256_digest(&ciphertext),
+            "unwrapProfile": "galvofs-destructive-boot-v0",
+            "context": { "spiffeId": "spiffe://femto.local/run/run-1" },
+            "mandate": mandate
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 403);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["code"], "policy-denied");
 }
