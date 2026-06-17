@@ -7,5 +7,6 @@ pub mod mandate;
 pub mod persist;
 pub mod rusty_engine;
 pub mod seal;
+pub mod trust_anchors;
 pub mod types;
 pub mod vault;
