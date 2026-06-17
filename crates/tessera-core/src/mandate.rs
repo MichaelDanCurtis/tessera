@@ -156,6 +156,121 @@ pub fn verify_signature(mandate: &Value, anchors: &TrustAnchorsView) -> Result<(
         .map_err(|_| MandateError::Unverifiable("ed25519 verification failed".into()))
 }
 
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
+
+/// Identity fields from the trust request used for P1-minimal binding.
+#[derive(Debug, Clone, Default)]
+pub struct RequestBinding {
+    pub spiffe_id: Option<String>,
+    pub trust_domain: Option<String>,
+}
+
+impl RequestBinding {
+    /// Extract binding identity from an unwrap request's `context` object.
+    pub fn from_unwrap_context(context: &Value) -> Self {
+        Self {
+            spiffe_id: context
+                .get("spiffeId")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            trust_domain: context
+                .get("trustDomain")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        }
+    }
+}
+
+fn parse_rfc3339(s: &str) -> Result<OffsetDateTime, MandateError> {
+    OffsetDateTime::parse(s, &Rfc3339)
+        .map_err(|_| MandateError::Invalid(format!("timestamp not RFC3339: {s}")))
+}
+
+/// §3.5.3 window: issuedAt <= now <= expiresAt.
+pub fn check_window(mandate: &Value, now_rfc3339: &str) -> Result<(), MandateError> {
+    let issued = mandate
+        .get("issuedAt")
+        .and_then(Value::as_str)
+        .ok_or_else(|| MandateError::Invalid("issuedAt missing".into()))?;
+    let expires = mandate
+        .get("expiresAt")
+        .and_then(Value::as_str)
+        .ok_or_else(|| MandateError::Invalid("expiresAt missing".into()))?;
+    let issued = parse_rfc3339(issued)?;
+    let expires = parse_rfc3339(expires)?;
+    let now = parse_rfc3339(now_rfc3339)?;
+    if now < issued {
+        return Err(MandateError::Invalid("mandate not yet valid".into()));
+    }
+    if now > expires {
+        return Err(MandateError::Invalid("mandate expired".into()));
+    }
+    Ok(())
+}
+
+/// §3.5.4 audience: mandate.audience == configured audience.
+pub fn check_audience(mandate: &Value, configured: &str) -> Result<(), MandateError> {
+    let aud = mandate
+        .get("audience")
+        .and_then(Value::as_str)
+        .ok_or_else(|| MandateError::Invalid("audience missing".into()))?;
+    if aud == configured {
+        Ok(())
+    } else {
+        Err(MandateError::PolicyDenied(format!(
+            "audience {aud} != configured {configured}"
+        )))
+    }
+}
+
+fn mandate_subject(mandate: &Value) -> Result<&str, MandateError> {
+    mandate
+        .get("subject")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| MandateError::Invalid("subject missing/empty".into()))
+}
+
+/// §3.5.5 binding for the issue route: the requested spiffeId must equal or
+/// extend the mandate subject (P1-loose). Subject must be present.
+pub fn check_binding_issue(mandate: &Value, req: &RequestBinding) -> Result<(), MandateError> {
+    let subject = mandate_subject(mandate)?;
+    let spiffe = req
+        .spiffe_id
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| MandateError::PolicyDenied("request spiffeId missing".into()))?;
+    // `starts_with(subject)` already covers exact-equality and `/`-extension
+    // (P1-loose per §3.5; deepened to structured cell-eligibility in P3).
+    if spiffe.starts_with(subject) {
+        Ok(())
+    } else {
+        Err(MandateError::PolicyDenied(format!(
+            "requested spiffeId {spiffe} not within mandate subject {subject}"
+        )))
+    }
+}
+
+/// §3.5.5 binding for the unwrap route: if context.spiffeId is present it must
+/// equal/extend the subject; if absent, P1 permits (audience + subject already
+/// enforced upstream).
+pub fn check_binding_unwrap(mandate: &Value, req: &RequestBinding) -> Result<(), MandateError> {
+    let subject = mandate_subject(mandate)?;
+    match req.spiffe_id.as_deref().filter(|s| !s.is_empty()) {
+        None => Ok(()),
+        Some(spiffe) => {
+            if spiffe.starts_with(subject) {
+                Ok(())
+            } else {
+                Err(MandateError::PolicyDenied(format!(
+                    "context spiffeId {spiffe} not within mandate subject {subject}"
+                )))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod canonical_tests {
     use super::canonical_signing_payload;
@@ -321,6 +436,108 @@ mod sig_tests {
             verify_signature(&m, &view),
             Err(MandateError::Unverifiable(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod claim_tests {
+    use super::test_fixtures::*;
+    use super::{
+        check_audience, check_binding_issue, check_binding_unwrap, check_window, MandateError,
+        RequestBinding,
+    };
+    use serde_json::{json, Value};
+
+    fn m(issued: &str, expires: &str) -> Value {
+        let mut v = unsigned_mandate((issued, "spiffe://f/run/1", "tessera.local"));
+        v["expiresAt"] = Value::String(expires.into());
+        v
+    }
+
+    #[test]
+    fn window_accepts_now_inside() {
+        let v = m("2026-06-14T00:00:00Z", "2026-06-14T01:00:00Z");
+        assert!(check_window(&v, "2026-06-14T00:30:00Z").is_ok());
+    }
+    #[test]
+    fn window_rejects_not_yet_valid() {
+        let v = m("2026-06-14T02:00:00Z", "2026-06-14T03:00:00Z");
+        assert!(matches!(
+            check_window(&v, "2026-06-14T00:30:00Z"),
+            Err(MandateError::Invalid(_))
+        ));
+    }
+    #[test]
+    fn window_rejects_expired() {
+        let v = m("2026-06-14T00:00:00Z", "2026-06-14T00:10:00Z");
+        assert!(matches!(
+            check_window(&v, "2026-06-14T00:30:00Z"),
+            Err(MandateError::Invalid(_))
+        ));
+    }
+    #[test]
+    fn window_rejects_unparseable_timestamp() {
+        let v = m("not-a-date", "2026-06-14T01:00:00Z");
+        assert!(matches!(
+            check_window(&v, "2026-06-14T00:30:00Z"),
+            Err(MandateError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn audience_match_ok_mismatch_denied() {
+        let v = m("2026-06-14T00:00:00Z", "2999-01-01T00:00:00Z");
+        assert!(check_audience(&v, "tessera.local").is_ok());
+        assert!(matches!(
+            check_audience(&v, "other.domain"),
+            Err(MandateError::PolicyDenied(_))
+        ));
+    }
+
+    #[test]
+    fn issue_binding_requires_spiffe_under_subject() {
+        let v = unsigned_mandate((
+            "2026-06-14T00:00:00Z",
+            "spiffe://femto.local/run",
+            "tessera.local",
+        ));
+        // requested spiffeId extends subject -> ok
+        let ok = RequestBinding {
+            spiffe_id: Some("spiffe://femto.local/run/run-1".into()),
+            trust_domain: Some("femto.local".into()),
+        };
+        assert!(check_binding_issue(&v, &ok).is_ok());
+        // requested spiffeId unrelated -> denied
+        let bad = RequestBinding {
+            spiffe_id: Some("spiffe://evil.test/x".into()),
+            trust_domain: Some("evil.test".into()),
+        };
+        assert!(matches!(
+            check_binding_issue(&v, &bad),
+            Err(MandateError::PolicyDenied(_))
+        ));
+    }
+
+    #[test]
+    fn unwrap_binding_context_spiffe_must_match_subject() {
+        let v = unsigned_mandate((
+            "2026-06-14T00:00:00Z",
+            "spiffe://femto.local/run",
+            "tessera.local",
+        ));
+        let ctx = json!({ "spiffeId": "spiffe://femto.local/run/run-1" });
+        let ok = RequestBinding::from_unwrap_context(&ctx);
+        assert!(check_binding_unwrap(&v, &ok).is_ok());
+        let ctx_bad = json!({ "spiffeId": "spiffe://evil/x" });
+        let bad = RequestBinding::from_unwrap_context(&ctx_bad);
+        assert!(matches!(
+            check_binding_unwrap(&v, &bad),
+            Err(MandateError::PolicyDenied(_))
+        ));
+        // absent spiffeId in P1 is allowed (audience + subject already enforced)
+        let ctx_empty = json!({});
+        let empty = RequestBinding::from_unwrap_context(&ctx_empty);
+        assert!(check_binding_unwrap(&v, &empty).is_ok());
     }
 }
 
