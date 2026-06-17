@@ -271,6 +271,116 @@ pub fn check_binding_unwrap(mandate: &Value, req: &RequestBinding) -> Result<(),
     }
 }
 
+/// Verified claims surfaced to the route for audit + downstream use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MandateClaims {
+    pub mandate_id: String,
+    pub key_id: String,
+    pub subject: String,
+    pub audience: String,
+}
+
+/// Outcome of verification. `SkippedDev` is the back-compat no-mandate path
+/// allowed only when `allow_unsigned_dev`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MandateOutcome {
+    Verified(MandateClaims),
+    SkippedDev,
+}
+
+/// Which trust route is verifying — selects the binding rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustRoute {
+    Issue,
+    Unwrap,
+}
+
+/// Route-independent verification config loaded from env at startup.
+#[derive(Debug, Clone)]
+pub struct VerifyConfig {
+    pub audience: String,
+    pub allow_unsigned_dev: bool,
+}
+
+/// Run §3.5 steps 1-5 over an optional received mandate. Returns the verified
+/// claims, the dev-skip marker, or the first failure mapped to a MandateError.
+pub fn verify_mandate(
+    mandate: Option<&Value>,
+    route: TrustRoute,
+    binding: &RequestBinding,
+    anchors: &TrustAnchorsView,
+    cfg: &VerifyConfig,
+    now_rfc3339: &str,
+) -> Result<MandateOutcome, MandateError> {
+    // Step 1: presence.
+    let mandate = match mandate {
+        Some(m) => m,
+        None => {
+            return if cfg.allow_unsigned_dev {
+                Ok(MandateOutcome::SkippedDev)
+            } else {
+                Err(MandateError::Invalid("mandate required in prod".into()))
+            };
+        }
+    };
+
+    // Step 2: signature (alg gate, anchor resolve, ed25519 verify).
+    let alg = mandate
+        .get("signature")
+        .and_then(|s| s.get("alg"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| MandateError::Invalid("signature.alg missing".into()))?;
+    match alg {
+        "ed25519" => verify_signature(mandate, anchors)?,
+        "unsigned-dev" if cfg.allow_unsigned_dev => { /* dev escape hatch: skip sig */ }
+        "unsigned-dev" => {
+            return Err(MandateError::Unverifiable(
+                "unsigned-dev mandate rejected (prod)".into(),
+            ));
+        }
+        other => {
+            return Err(MandateError::Unverifiable(format!(
+                "unsupported signature alg {other}"
+            )));
+        }
+    }
+
+    // Step 3: window.
+    check_window(mandate, now_rfc3339)?;
+    // Step 4: audience.
+    check_audience(mandate, &cfg.audience)?;
+    // Step 5: binding.
+    match route {
+        TrustRoute::Issue => check_binding_issue(mandate, binding)?,
+        TrustRoute::Unwrap => check_binding_unwrap(mandate, binding)?,
+    }
+
+    let claims = MandateClaims {
+        mandate_id: mandate
+            .get("mandateId")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        key_id: mandate
+            .get("signature")
+            .and_then(|s| s.get("keyId"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        subject: mandate
+            .get("subject")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        audience: mandate
+            .get("audience")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+    };
+    Ok(MandateOutcome::Verified(claims))
+}
+
 #[cfg(test)]
 mod canonical_tests {
     use super::canonical_signing_payload;
@@ -538,6 +648,149 @@ mod claim_tests {
         let ctx_empty = json!({});
         let empty = RequestBinding::from_unwrap_context(&ctx_empty);
         assert!(check_binding_unwrap(&v, &empty).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod verify_tests {
+    use super::test_fixtures::*;
+    use super::{
+        verify_mandate, MandateError, MandateOutcome, RequestBinding, TrustAnchorsView, TrustRoute,
+        VerifyConfig,
+    };
+    use serde_json::Value;
+
+    fn anchors() -> TrustAnchorsView {
+        TrustAnchorsView::from_pairs(&[(FIXTURE_KEY_ID.to_string(), fixture_pubkey_b64())]).unwrap()
+    }
+    fn cfg(allow_unsigned_dev: bool) -> VerifyConfig {
+        VerifyConfig {
+            audience: "tessera.local".into(),
+            allow_unsigned_dev,
+        }
+    }
+    fn signed_valid() -> Value {
+        let mut m = unsigned_mandate((
+            "2026-06-14T00:00:00Z",
+            "spiffe://femto.local/run",
+            "tessera.local",
+        ));
+        sign_mandate(&mut m);
+        m
+    }
+    fn binding() -> RequestBinding {
+        RequestBinding {
+            spiffe_id: Some("spiffe://femto.local/run/run-1".into()),
+            trust_domain: Some("femto.local".into()),
+        }
+    }
+
+    #[test]
+    fn valid_signed_mandate_verifies_and_returns_claims() {
+        let m = signed_valid();
+        let out = verify_mandate(
+            Some(&m),
+            TrustRoute::Issue,
+            &binding(),
+            &anchors(),
+            &cfg(false),
+            "2026-06-14T00:30:00Z",
+        )
+        .unwrap();
+        match out {
+            MandateOutcome::Verified(claims) => {
+                assert_eq!(claims.mandate_id, "m-fixture-1");
+                assert_eq!(claims.key_id, FIXTURE_KEY_ID);
+                assert_eq!(claims.audience, "tessera.local");
+            }
+            _ => panic!("expected Verified"),
+        }
+    }
+
+    #[test]
+    fn absent_mandate_in_prod_is_invalid() {
+        let err = verify_mandate(
+            None,
+            TrustRoute::Issue,
+            &binding(),
+            &anchors(),
+            &cfg(false),
+            "2026-06-14T00:30:00Z",
+        )
+        .unwrap_err();
+        assert!(matches!(err, MandateError::Invalid(_)));
+    }
+
+    #[test]
+    fn absent_mandate_in_dev_is_skipped() {
+        let out = verify_mandate(
+            None,
+            TrustRoute::Issue,
+            &binding(),
+            &anchors(),
+            &cfg(true),
+            "2026-06-14T00:30:00Z",
+        )
+        .unwrap();
+        assert!(matches!(out, MandateOutcome::SkippedDev));
+    }
+
+    #[test]
+    fn unsigned_dev_alg_rejected_in_prod() {
+        let mut m = signed_valid();
+        m["signature"]["alg"] = Value::String("unsigned-dev".into());
+        m["signature"]["value"] = Value::String(String::new());
+        let err = verify_mandate(
+            Some(&m),
+            TrustRoute::Issue,
+            &binding(),
+            &anchors(),
+            &cfg(false),
+            "2026-06-14T00:30:00Z",
+        )
+        .unwrap_err();
+        assert!(matches!(err, MandateError::Unverifiable(_)));
+    }
+
+    #[test]
+    fn unsigned_dev_alg_accepted_in_dev() {
+        let mut m = unsigned_mandate((
+            "2026-06-14T00:00:00Z",
+            "spiffe://femto.local/run",
+            "tessera.local",
+        ));
+        m["signature"]["alg"] = Value::String("unsigned-dev".into());
+        let out = verify_mandate(
+            Some(&m),
+            TrustRoute::Issue,
+            &binding(),
+            &anchors(),
+            &cfg(true),
+            "2026-06-14T00:30:00Z",
+        )
+        .unwrap();
+        assert!(matches!(out, MandateOutcome::Verified(_)));
+    }
+
+    #[test]
+    fn expired_signed_mandate_is_invalid() {
+        let mut m = unsigned_mandate((
+            "2026-06-14T00:00:00Z",
+            "spiffe://femto.local/run",
+            "tessera.local",
+        ));
+        m["expiresAt"] = Value::String("2026-06-14T00:10:00Z".into());
+        sign_mandate(&mut m);
+        let err = verify_mandate(
+            Some(&m),
+            TrustRoute::Issue,
+            &binding(),
+            &anchors(),
+            &cfg(false),
+            "2026-06-14T00:30:00Z",
+        )
+        .unwrap_err();
+        assert!(matches!(err, MandateError::Invalid(_)));
     }
 }
 
