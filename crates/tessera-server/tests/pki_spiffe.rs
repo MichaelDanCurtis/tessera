@@ -9,7 +9,7 @@ use tessera_core::clock::FixedClock;
 use tessera_core::engine::InMemoryEngine;
 use tessera_core::seal::SealState;
 use tessera_core::vault::VaultStore;
-use tessera_server::app::{router, AppState};
+use tessera_server::app::{router, AppState, TrustConfig};
 
 fn pki_state() -> AppState {
     let mut tokens = TokenStore::new();
@@ -27,6 +27,7 @@ fn pki_state() -> AppState {
     );
     AppState {
         vault: Arc::new(vault),
+        trust: TrustConfig::dev_default(),
     }
 }
 
