@@ -109,6 +109,11 @@ impl RustyVaultEngine {
         std::thread::Builder::new()
             .name("tessera-rustyvault".to_string())
             .spawn(move || {
+                // INVARIANT: must stay `current_thread`. `put_if_absent_job`'s
+                // read-then-conditional-write is atomic ONLY because this worker is
+                // single-threaded (no other job interleaves between its two awaits).
+                // A `multi_thread` runtime silently reintroduces a TOCTOU replay race
+                // in the nonce ledger — see `put_if_absent_job` before changing this.
                 let rt = match tokio::runtime::Builder::new_current_thread().build() {
                     Ok(rt) => rt,
                     Err(e) => {
@@ -269,6 +274,21 @@ async fn handle_job(
 /// Atomic put-if-absent on the worker thread: one Read then a conditional
 /// Write, with no other job interleaving (single-threaded worker). Returns
 /// `true` if it wrote (was absent), `false` if a value already existed.
+///
+/// SAFETY/INVARIANT: the read-then-conditional-write below is atomic ONLY
+/// because the worker runs on a `current_thread` Tokio runtime (built via
+/// `Builder::new_current_thread()` in `open()` above). On a single-threaded
+/// runtime the two internal `.await`s (Read, then Write) cannot interleave
+/// with another job draining `rx`, so no concurrent `put_if_absent` can slip
+/// a Write between this job's Read and Write. This is the one-time-unwrap
+/// nonce ledger's entire replay guarantee.
+///
+/// DO NOT switch the worker to a `multi_thread` runtime: that would silently
+/// reintroduce a TOCTOU race (two jobs both Read "absent", both Write → the
+/// nonce is consumed twice → replay). If a multi-threaded worker is ever
+/// required, make `put_if_absent` serialize the read-modify-write itself
+/// (hold a per-path lock / mutex around the Read+Write, or use a real
+/// compare-and-set primitive) before changing the runtime.
 async fn put_if_absent_job(
     core: &Arc<RwLock<Core>>,
     root_token: &str,
