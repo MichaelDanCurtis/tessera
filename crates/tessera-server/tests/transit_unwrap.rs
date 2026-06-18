@@ -423,8 +423,7 @@ async fn unwrap_different_nonce_same_key_is_allowed() {
     let ciphertext = seal_fixture(key_ref, &nonce, plaintext);
 
     for idem in ["idem-A", "idem-B"] {
-        let mandate =
-            signed_unwrap_mandate_idem("spiffe://femto.local/run", "tessera.local", idem);
+        let mandate = signed_unwrap_mandate_idem("spiffe://femto.local/run", "tessera.local", idem);
         let res = client
             .post(format!("{base}/v1/transit/unwrap/galvofs"))
             .header("Authorization", "Bearer unwrap-tok")

@@ -95,7 +95,9 @@ fn mandate_err_response(err: &MandateError) -> (StatusCode, Json<Value>) {
 fn replay_detected_response() -> (StatusCode, Json<Value>) {
     (
         StatusCode::FORBIDDEN,
-        Json(json!({ "errors": ["replay-detected: unwrap nonce already consumed"], "code": "replay-detected" })),
+        Json(
+            json!({ "errors": ["replay-detected: unwrap nonce already consumed"], "code": "replay-detected" }),
+        ),
     )
 }
 
