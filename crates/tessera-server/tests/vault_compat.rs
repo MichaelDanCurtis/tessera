@@ -10,7 +10,7 @@ use tessera_core::engine::InMemoryEngine;
 use tessera_core::seal::SealState;
 use tessera_core::types::{SecretPath, SecretValue};
 use tessera_core::vault::VaultStore;
-use tessera_server::app::{router, AppState};
+use tessera_server::app::{router, AppState, TrustConfig};
 
 async fn spawn_unsealed_with_secrets() -> AppState {
     let mut tokens = TokenStore::new();
@@ -50,6 +50,7 @@ async fn spawn_unsealed_with_secrets() -> AppState {
         .unwrap();
     AppState {
         vault: Arc::new(vault),
+        trust: TrustConfig::dev_default(),
     }
 }
 
@@ -120,6 +121,7 @@ async fn sealed_health_returns_503() {
         );
         AppState {
             vault: Arc::new(vault),
+            trust: TrustConfig::dev_default(),
         }
     };
     let base = serve(state).await;

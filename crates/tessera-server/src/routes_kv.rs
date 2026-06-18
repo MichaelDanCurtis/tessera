@@ -332,6 +332,7 @@ mod tests {
         );
         AppState {
             vault: Arc::new(vault),
+            trust: crate::app::TrustConfig::dev_default(),
         }
     }
 

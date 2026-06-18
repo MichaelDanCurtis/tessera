@@ -14,10 +14,16 @@ path = "src/main.rs"
 
 [dependencies]
 tessera-core = { path = "../tessera-core" }
+aes-gcm = "0.10"
+base64 = "0.22.1"
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = "0.10"
 tokio = { workspace = true }
 axum = { workspace = true }
+blake3 = { workspace = true }
+rcgen = { workspace = true }
+time = { workspace = true }
 
 [dev-dependencies]
 tower = { workspace = true }
@@ -25,4 +31,6 @@ reqwest = { version = "0.12", default-features = false, features = ["json"] }
 serde_json = { workspace = true }
 tessera-core = { path = "../tessera-core" }
 tokio = { workspace = true }
+# Route enforcement tests sign fixture mandates with a known ed25519 seed.
+ed25519-dalek = "2"
 tempfile = "3"

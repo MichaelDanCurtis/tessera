@@ -61,13 +61,19 @@ async fn main() {
 
     // Seed an admin policy + static admin token from env so the Galvo proxy can
     // administer the vault out of the box. The admin token is a STATIC inline
-    // token granting sys/ (and secret/ so it can also drive the KV path on
-    // behalf of operators) — it is never persisted to tokens.json.
+    // token granting sys/, secret/, pki/, and transit/ so it can drive the KV,
+    // trust, and unwrap paths on behalf of operators — it is never persisted.
     if let Some(admin) = &cfg.admin_token {
         policies
-            .put("admin", Policy::new(["sys/", "secret/"]))
+            .put(
+                "admin",
+                Policy::new(["sys/", "secret/", "pki/", "transit/"]),
+            )
             .expect("seed admin policy");
-        tokens.insert(admin.clone(), Policy::new(["sys/", "secret/"]));
+        tokens.insert(
+            admin.clone(),
+            Policy::new(["sys/", "secret/", "pki/", "transit/"]),
+        );
     }
 
     let vault = VaultStore::new(
@@ -78,8 +84,32 @@ async fn main() {
         audit,
         Arc::new(SystemClock),
     );
+
+    // Parse trust anchors at startup; a bad spec is fatal (fail-closed).
+    let anchors =
+        match tessera_core::trust_anchors::TrustAnchors::from_str_spec(&cfg.arc_trust_anchors) {
+            Ok(a) => std::sync::Arc::new(a),
+            Err(e) => {
+                eprintln!("tessera: TESSERA_ARC_TRUST_ANCHORS invalid: {e}");
+                std::process::exit(1);
+            }
+        };
+    if anchors.view().is_empty() && !cfg.allow_unsigned_dev {
+        eprintln!(
+            "tessera: WARNING no trust anchors and unsigned-dev disabled — all mandates will be rejected"
+        );
+    }
+    let trust = tessera_server::app::TrustConfig {
+        anchors,
+        verify: tessera_core::mandate::VerifyConfig {
+            audience: cfg.audience.clone(),
+            allow_unsigned_dev: cfg.allow_unsigned_dev,
+        },
+    };
+
     let state = AppState {
         vault: Arc::new(vault),
+        trust,
     };
 
     let listener = tokio::net::TcpListener::bind(&cfg.bind)
