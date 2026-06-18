@@ -1,0 +1,52 @@
+{
+  "keyId": "arc-key-test-1",
+  "seedB64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+  "publicKeyB64": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
+  "mandate": {
+    "mandateId": "mandate-wo_vector_1",
+    "format": "a2e-json-dev",
+    "issuer": "arc:vector",
+    "subject": "customer:vector",
+    "audience": "femto.vector",
+    "issuedAt": "2026-06-17T00:00:00Z",
+    "expiresAt": "2026-06-17T01:00:00Z",
+    "authority": {
+      "quoteId": "quote-vector",
+      "processor": "a2p:vector",
+      "currency": "USD",
+      "maxCharge": "0.00",
+      "settlementMode": "none"
+    },
+    "certifies": {
+      "action": "a2e.work-order.execute",
+      "workOrderHash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "idempotencyKey": "idem-wo_vector_1"
+    },
+    "scope": {
+      "data": [],
+      "models": [],
+      "runtimeClasses": [
+        "instant",
+        "warm",
+        "scheduled",
+        "batch"
+      ]
+    },
+    "limits": {
+      "maxWallSeconds": 30
+    },
+    "policy": {
+      "humanApprovalRequired": false,
+      "untrustedCode": false,
+      "network": "none",
+      "secretAccess": "none"
+    },
+    "signature": {
+      "alg": "ed25519",
+      "value": "",
+      "keyId": "arc-key-test-1"
+    }
+  },
+  "canonicalUtf8": "{\"audience\":\"femto.vector\",\"authority\":{\"currency\":\"USD\",\"maxCharge\":\"0.00\",\"processor\":\"a2p:vector\",\"quoteId\":\"quote-vector\",\"settlementMode\":\"none\"},\"certifies\":{\"action\":\"a2e.work-order.execute\",\"idempotencyKey\":\"idem-wo_vector_1\",\"workOrderHash\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\"},\"expiresAt\":\"2026-06-17T01:00:00Z\",\"format\":\"a2e-json-dev\",\"issuedAt\":\"2026-06-17T00:00:00Z\",\"issuer\":\"arc:vector\",\"limits\":{\"maxWallSeconds\":30},\"mandateId\":\"mandate-wo_vector_1\",\"policy\":{\"humanApprovalRequired\":false,\"network\":\"none\",\"secretAccess\":\"none\",\"untrustedCode\":false},\"scope\":{\"data\":[],\"models\":[],\"runtimeClasses\":[\"instant\",\"warm\",\"scheduled\",\"batch\"]},\"signature\":{\"alg\":\"ed25519\",\"keyId\":\"arc-key-test-1\",\"value\":\"\"},\"subject\":\"customer:vector\"}",
+  "signatureB64": "OhPHmTWKCZZVJssXN8bwKNQmpUTiJm4IELhV5k2paGGuHWSzvn9orhdemXPcklBOyP5FAdvyDjekwEKx2E5FBA=="
+}
