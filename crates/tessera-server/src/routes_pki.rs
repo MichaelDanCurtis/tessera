@@ -7,6 +7,9 @@ use rcgen::{CertificateParams, DistinguishedName, DnType, Ia5String, KeyPair, Sa
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tessera_core::audit::AuditOp;
+use tessera_core::mandate::{
+    verify_mandate, MandateError, MandateOutcome, RequestBinding, TrustRoute,
+};
 use tessera_core::types::{SecretPath, TesseraError};
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
@@ -27,6 +30,8 @@ struct SpiffeIssueRequest {
     #[serde(rename = "ttlSeconds")]
     ttl_seconds: Option<i64>,
     profile: Option<String>,
+    #[serde(default)]
+    mandate: Option<Value>,
 }
 
 pub fn routes() -> Router<AppState> {
@@ -60,6 +65,19 @@ fn bad_request(msg: impl Into<String>) -> (StatusCode, Json<Value>) {
     (
         StatusCode::BAD_REQUEST,
         Json(json!({ "errors": [msg.into()] })),
+    )
+}
+
+/// Map a mandate verification failure to its A2E HTTP status + `code` body.
+/// mandate-invalid -> 400; mandate-unverifiable / policy-denied -> 403.
+fn mandate_err_response(err: &MandateError) -> (StatusCode, Json<Value>) {
+    let status = match err {
+        MandateError::Invalid(_) => StatusCode::BAD_REQUEST,
+        MandateError::Unverifiable(_) | MandateError::PolicyDenied(_) => StatusCode::FORBIDDEN,
+    };
+    (
+        status,
+        Json(json!({ "errors": [err.to_string()], "code": err.code() })),
     )
 }
 
@@ -146,6 +164,30 @@ async fn issue_spiffe(
         return err_response(e).into_response();
     }
 
+    // Mandate verification (trust-plane §3.5) — after auth, before issuance.
+    let now = state.vault.clock().now_rfc3339();
+    let binding = RequestBinding {
+        spiffe_id: Some(req.spiffe_id.clone()),
+        trust_domain: Some(req.trust_domain.clone()),
+    };
+    let claims = match verify_mandate(
+        req.mandate.as_ref(),
+        TrustRoute::Issue,
+        &binding,
+        state.trust.anchors.view(),
+        &state.trust.verify,
+        &now,
+    ) {
+        Ok(MandateOutcome::Verified(c)) => Some(c),
+        Ok(MandateOutcome::SkippedDev) => None,
+        Err(e) => {
+            state
+                .vault
+                .record_action(AuditOp::IssueCertificate, &scope, &token, false);
+            return mandate_err_response(&e).into_response();
+        }
+    };
+
     if let Err(e) = validate_spiffe(&req) {
         state
             .vault
@@ -184,9 +226,16 @@ async fn issue_spiffe(
             }
         };
     let certificate_serial = issued_serial(&req.spiffe_id, &not_before, &not_after);
+    let audit_scope = match &claims {
+        Some(c) => SecretPath::new(
+            scope.mount.clone(),
+            format!("{}|mandate={}|keyId={}", scope.path, c.mandate_id, c.key_id),
+        ),
+        None => scope.clone(),
+    };
     state
         .vault
-        .record_action(AuditOp::IssueCertificate, &scope, &token, true);
+        .record_action(AuditOp::IssueCertificate, &audit_scope, &token, true);
 
     (
         StatusCode::OK,

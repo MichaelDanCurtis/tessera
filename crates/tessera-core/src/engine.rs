@@ -13,6 +13,13 @@ pub trait SecretEngine: Send + Sync {
     async fn delete(&self, path: &SecretPath) -> Result<(), TesseraError>;
     /// List immediate key names under `prefix` (mount+path prefix), sorted + deduped.
     async fn list(&self, prefix: &SecretPath) -> Result<Vec<String>, TesseraError>;
+
+    /// Atomic check-and-insert. Inserts `blob` at `path` only if no value
+    /// currently exists there. Returns `true` if inserted (first use), `false`
+    /// if a value already existed (the key is "consumed"). The check and the
+    /// insert happen under a single critical section so concurrent callers see
+    /// exactly one `true`.
+    async fn put_if_absent(&self, path: &SecretPath, blob: Vec<u8>) -> Result<bool, TesseraError>;
 }
 
 /// In-memory blob engine for tests and the contract test. No wall-clock, no
@@ -62,6 +69,18 @@ impl SecretEngine for InMemoryEngine {
         keys.sort();
         keys.dedup();
         Ok(keys)
+    }
+
+    async fn put_if_absent(&self, path: &SecretPath, blob: Vec<u8>) -> Result<bool, TesseraError> {
+        use std::collections::btree_map::Entry;
+        let mut store = self.store.lock().unwrap();
+        match store.entry(path.scope()) {
+            Entry::Occupied(_) => Ok(false),
+            Entry::Vacant(slot) => {
+                slot.insert(blob);
+                Ok(true)
+            }
+        }
     }
 }
 
@@ -126,5 +145,45 @@ mod tests {
             .unwrap();
         let keys = eng.list(&SecretPath::new("secret", "galvo")).await.unwrap();
         assert_eq!(keys, vec!["anthropic".to_string(), "openai".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn put_if_absent_inserts_first_returns_true() {
+        let eng = InMemoryEngine::new();
+        let p = SecretPath::new("tessera-sys", "a2e-nonce-ledger/abc");
+        assert!(eng.put_if_absent(&p, b"marker".to_vec()).await.unwrap());
+        assert_eq!(eng.get(&p).await.unwrap(), Some(b"marker".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn put_if_absent_second_returns_false_and_keeps_first() {
+        let eng = InMemoryEngine::new();
+        let p = SecretPath::new("tessera-sys", "a2e-nonce-ledger/abc");
+        assert!(eng.put_if_absent(&p, b"first".to_vec()).await.unwrap());
+        assert!(!eng.put_if_absent(&p, b"second".to_vec()).await.unwrap());
+        // The original value is preserved (insert did not overwrite).
+        assert_eq!(eng.get(&p).await.unwrap(), Some(b"first".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn put_if_absent_is_concurrent_safe_exactly_one_true() {
+        // 32 concurrent inserters on the SAME key: exactly one sees `true`.
+        let eng = std::sync::Arc::new(InMemoryEngine::new());
+        let p = SecretPath::new("tessera-sys", "a2e-nonce-ledger/race");
+        let mut handles = Vec::new();
+        for _ in 0..32 {
+            let eng = std::sync::Arc::clone(&eng);
+            let p = p.clone();
+            handles.push(tokio::spawn(async move {
+                eng.put_if_absent(&p, b"x".to_vec()).await.unwrap()
+            }));
+        }
+        let mut trues = 0;
+        for h in handles {
+            if h.await.unwrap() {
+                trues += 1;
+            }
+        }
+        assert_eq!(trues, 1, "exactly one inserter must win");
     }
 }

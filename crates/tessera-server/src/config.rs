@@ -5,6 +5,9 @@ pub struct Config {
     pub data_dir: String,
     pub crypto_backend: String,
     pub admin_token: Option<String>,
+    pub arc_trust_anchors: String, // raw spec, parsed in main
+    pub audience: String,
+    pub allow_unsigned_dev: bool,
 }
 
 // Manual Debug that REDACTS the master key. `Config` needs `Debug` for tests'
@@ -20,6 +23,9 @@ impl std::fmt::Debug for Config {
                 "admin_token",
                 &self.admin_token.as_ref().map(|_| "<redacted>"),
             )
+            .field("arc_trust_anchors", &self.arc_trust_anchors)
+            .field("audience", &self.audience)
+            .field("allow_unsigned_dev", &self.allow_unsigned_dev)
             .finish()
     }
 }
@@ -47,12 +53,20 @@ pub fn from_getter(get: impl Fn(&str) -> Option<String>) -> Result<Config, Confi
     let crypto_backend = get("TESSERA_CRYPTO_BACKEND").unwrap_or_else(|| "openssl".to_string());
     validate_crypto(&crypto_backend)?;
     let admin_token = get("TESSERA_ADMIN_TOKEN").filter(|s| !s.is_empty());
+    let arc_trust_anchors = get("TESSERA_ARC_TRUST_ANCHORS").unwrap_or_default();
+    let audience = get("TESSERA_AUDIENCE").unwrap_or_else(|| "tessera.local".to_string());
+    let allow_unsigned_dev = get("TESSERA_ALLOW_UNSIGNED_DEV")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
     Ok(Config {
         bind: get("TESSERA_BIND").unwrap_or_else(|| "127.0.0.1:8200".to_string()),
         master_key: master_key.into_bytes(),
         data_dir: get("TESSERA_DATA_DIR").unwrap_or_else(|| "./data".to_string()),
         crypto_backend,
         admin_token,
+        arc_trust_anchors,
+        audience,
+        allow_unsigned_dev,
     })
 }
 
@@ -122,6 +136,26 @@ mod tests {
             !rendered.contains("admin-secret-xyz"),
             "admin token must be redacted in Debug"
         );
+    }
+
+    #[test]
+    fn trust_env_defaults_safe() {
+        let cfg = from_getter(getter(&[("TESSERA_MASTER_KEY", "k")])).unwrap();
+        assert_eq!(cfg.audience, "tessera.local");
+        assert!(!cfg.allow_unsigned_dev, "prod default must be fail-closed");
+        assert_eq!(cfg.arc_trust_anchors, "");
+    }
+
+    #[test]
+    fn allow_unsigned_dev_parses_truthy() {
+        let cfg = from_getter(getter(&[
+            ("TESSERA_MASTER_KEY", "k"),
+            ("TESSERA_ALLOW_UNSIGNED_DEV", "true"),
+            ("TESSERA_AUDIENCE", "femto.test"),
+        ]))
+        .unwrap();
+        assert!(cfg.allow_unsigned_dev);
+        assert_eq!(cfg.audience, "femto.test");
     }
 
     #[test]

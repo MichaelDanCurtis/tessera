@@ -308,6 +308,7 @@ mod tests {
         );
         AppState {
             vault: Arc::new(vault),
+            trust: crate::app::TrustConfig::dev_default(),
         }
     }
 
@@ -363,6 +364,7 @@ mod tests {
         (
             AppState {
                 vault: Arc::new(vault),
+                trust: crate::app::TrustConfig::dev_default(),
             },
             "admin-tok".to_string(),
         )
