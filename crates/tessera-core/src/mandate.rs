@@ -285,6 +285,9 @@ pub struct MandateClaims {
     pub key_id: String,
     pub subject: String,
     pub audience: String,
+    /// `certifies.idempotencyKey` — the per-execution one-time nonce the unwrap
+    /// ledger (Phase 2) burns. Empty only on malformed mandates.
+    pub idempotency_key: String,
 }
 
 /// Outcome of verification. `SkippedDev` is the back-compat no-mandate path
@@ -381,6 +384,12 @@ pub fn verify_mandate(
             .to_string(),
         audience: mandate
             .get("audience")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        idempotency_key: mandate
+            .get("certifies")
+            .and_then(|c| c.get("idempotencyKey"))
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string(),
@@ -725,6 +734,7 @@ mod verify_tests {
                 assert_eq!(claims.mandate_id, "m-fixture-1");
                 assert_eq!(claims.key_id, FIXTURE_KEY_ID);
                 assert_eq!(claims.audience, "tessera.local");
+                assert_eq!(claims.idempotency_key, "idem-1"); // from certifies
             }
             _ => panic!("expected Verified"),
         }
