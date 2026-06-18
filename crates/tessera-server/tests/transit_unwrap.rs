@@ -52,6 +52,27 @@ fn signed_unwrap_mandate(subject: &str, audience: &str) -> Value {
     m
 }
 
+/// Like `signed_unwrap_mandate` but with a caller-chosen `certifies.idempotencyKey`
+/// — the one-time consume nonce the unwrap ledger burns (trust-plane Phase 2).
+fn signed_unwrap_mandate_idem(subject: &str, audience: &str, idem: &str) -> Value {
+    let mut m = json!({
+        "mandateId": "m-transit-1",
+        "format": "a2e-execution-mandate/v0",
+        "issuer": "galvo-arc",
+        "subject": subject,
+        "audience": audience,
+        "issuedAt": "2026-06-14T00:00:00Z",
+        "expiresAt": "2999-01-01T00:00:00Z",
+        "certifies": { "action": "execute", "workOrderHash": "sha256:beef", "idempotencyKey": idem },
+        "scope": { "data": [], "models": [], "runtimeClasses": ["wasm"] },
+        "signature": { "alg": "ed25519", "value": "", "keyId": FIXTURE_KEY_ID }
+    });
+    let payload = canonical_signing_payload(&m);
+    let sig = SigningKey::from_bytes(&FIXTURE_SEED).sign(&payload);
+    m["signature"]["value"] = Value::String(STANDARD.encode(sig.to_bytes()));
+    m
+}
+
 /// State enforcing mandates in prod mode against the fixture anchor.
 fn transit_state_enforcing() -> AppState {
     let mut state = transit_state();
@@ -333,4 +354,151 @@ async fn unwrap_audience_mismatch_is_policy_denied() {
     assert_eq!(res.status(), 403);
     let body: Value = res.json().await.unwrap();
     assert_eq!(body["code"], "policy-denied");
+}
+
+// One-time-unwrap ledger (trust-plane Phase 2). NOTE: these route tests use an
+// InMemoryEngine (does NOT persist across a fresh `serve()`), so the durable
+// restart-replay guarantee is proven at the engine level by
+// `put_if_absent_survives_reopen_same_dir` in tessera-core's rusty_engine tests.
+
+#[tokio::test]
+async fn unwrap_replay_same_nonce_is_replay_detected() {
+    let state = transit_state_enforcing();
+    let base = serve(state.clone()).await;
+    let client = reqwest::Client::new();
+    let key_ref = "tessera://transit/galvofs/replay-cap";
+    let nonce = [0x42; 12];
+    let plaintext = br#"{"sealed":true}"#;
+    let ciphertext = seal_fixture(key_ref, &nonce, plaintext);
+    let mandate =
+        signed_unwrap_mandate_idem("spiffe://femto.local/run", "tessera.local", "idem-replay");
+    let body = json!({
+        "keyRef": key_ref,
+        "cipherSuite": "aes-256-gcm",
+        "nonce": "hex:424242424242424242424242",
+        "ciphertextBase64": STANDARD.encode(&ciphertext),
+        "ciphertextDigest": sha256_digest(&ciphertext),
+        "unwrapProfile": "galvofs-destructive-boot-v0",
+        "context": { "spiffeId": "spiffe://femto.local/run/run-1" },
+        "mandate": mandate
+    });
+
+    // First unwrap: 200.
+    let r1 = client
+        .post(format!("{base}/v1/transit/unwrap/galvofs"))
+        .header("Authorization", "Bearer unwrap-tok")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), 200);
+
+    // Identical replay (same keyRef + same idempotencyKey): 403 replay-detected.
+    let r2 = client
+        .post(format!("{base}/v1/transit/unwrap/galvofs"))
+        .header("Authorization", "Bearer unwrap-tok")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), 403);
+    let b2: Value = r2.json().await.unwrap();
+    assert_eq!(b2["code"], "replay-detected");
+
+    // Audit: a TransitUnwrap outcome=false replay rejection exists.
+    let audit = state.vault.audit_sink().records();
+    assert!(audit
+        .iter()
+        .any(|r| r.op == AuditOp::TransitUnwrap && !r.outcome));
+}
+
+#[tokio::test]
+async fn unwrap_different_nonce_same_key_is_allowed() {
+    let state = transit_state_enforcing();
+    let base = serve(state.clone()).await;
+    let client = reqwest::Client::new();
+    let key_ref = "tessera://transit/galvofs/twononce-cap";
+    let nonce = [0x42; 12];
+    let plaintext = br#"{"sealed":true}"#;
+    let ciphertext = seal_fixture(key_ref, &nonce, plaintext);
+
+    for idem in ["idem-A", "idem-B"] {
+        let mandate =
+            signed_unwrap_mandate_idem("spiffe://femto.local/run", "tessera.local", idem);
+        let res = client
+            .post(format!("{base}/v1/transit/unwrap/galvofs"))
+            .header("Authorization", "Bearer unwrap-tok")
+            .json(&json!({
+                "keyRef": key_ref,
+                "cipherSuite": "aes-256-gcm",
+                "nonce": "hex:424242424242424242424242",
+                "ciphertextBase64": STANDARD.encode(&ciphertext),
+                "ciphertextDigest": sha256_digest(&ciphertext),
+                "unwrapProfile": "galvofs-destructive-boot-v0",
+                "context": { "spiffeId": "spiffe://femto.local/run/run-1" },
+                "mandate": mandate
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            200,
+            "distinct idempotencyKey {idem} must not be a replay"
+        );
+    }
+}
+
+#[tokio::test]
+async fn unwrap_burns_nonce_even_when_later_step_fails() {
+    let state = transit_state_enforcing();
+    let base = serve(state.clone()).await;
+    let client = reqwest::Client::new();
+    let key_ref = "tessera://transit/galvofs/burn-cap";
+    let nonce = [0x42; 12];
+    let plaintext = br#"{"sealed":true}"#;
+    let good_ct = seal_fixture(key_ref, &nonce, plaintext);
+    let mandate =
+        || signed_unwrap_mandate_idem("spiffe://femto.local/run", "tessera.local", "idem-burn");
+
+    // Attempt 1: valid mandate, but ciphertextDigest mismatch → 400 AFTER burn.
+    let r1 = client
+        .post(format!("{base}/v1/transit/unwrap/galvofs"))
+        .header("Authorization", "Bearer unwrap-tok")
+        .json(&json!({
+            "keyRef": key_ref,
+            "cipherSuite": "aes-256-gcm",
+            "nonce": "hex:424242424242424242424242",
+            "ciphertextBase64": STANDARD.encode(&good_ct),
+            "ciphertextDigest": "sha256:not-the-body",   // forces validate_request failure
+            "unwrapProfile": "galvofs-destructive-boot-v0",
+            "context": { "spiffeId": "spiffe://femto.local/run/run-1" },
+            "mandate": mandate()
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), 400);
+
+    // Attempt 2: SAME idempotencyKey, now a fully valid body → must be replay-detected,
+    // proving the nonce was burned on attempt 1's failed decrypt path.
+    let r2 = client
+        .post(format!("{base}/v1/transit/unwrap/galvofs"))
+        .header("Authorization", "Bearer unwrap-tok")
+        .json(&json!({
+            "keyRef": key_ref,
+            "cipherSuite": "aes-256-gcm",
+            "nonce": "hex:424242424242424242424242",
+            "ciphertextBase64": STANDARD.encode(&good_ct),
+            "ciphertextDigest": sha256_digest(&good_ct),
+            "unwrapProfile": "galvofs-destructive-boot-v0",
+            "context": { "spiffeId": "spiffe://femto.local/run/run-1" },
+            "mandate": mandate()
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), 403);
+    let b2: Value = r2.json().await.unwrap();
+    assert_eq!(b2["code"], "replay-detected");
 }
