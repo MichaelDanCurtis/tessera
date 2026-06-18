@@ -4,6 +4,7 @@ pub mod auth;
 pub mod clock;
 pub mod engine;
 pub mod mandate;
+pub mod nonce_ledger;
 pub mod persist;
 pub mod rusty_engine;
 pub mod seal;
