@@ -125,6 +125,29 @@ impl VaultStore {
         self.record(op, path, token, outcome);
     }
 
+    /// One-time unwrap ledger consume (trust-plane Phase 2). Atomically marks
+    /// `(key_ref, idempotency_key)` consumed in the durable engine under the
+    /// reserved `tessera-sys/a2e-nonce-ledger/{id}` path. Returns `Ok(true)` on
+    /// first use (caller may proceed) and `Ok(false)` on replay (caller must
+    /// reject). This bypasses token authz by design: the ledger is an internal
+    /// namespace no caller policy can reach. Burn-on-failure is the CALLER's
+    /// ordering choice (consume before decrypt) — once `true` is returned the
+    /// nonce stays burned.
+    pub async fn consume_nonce(
+        &self,
+        key_ref: &str,
+        idempotency_key: &str,
+    ) -> Result<bool, TesseraError> {
+        let id = crate::nonce_ledger::ledger_entry_id(key_ref, idempotency_key);
+        let path = crate::nonce_ledger::ledger_path(&id);
+        let now = self.clock.now_rfc3339();
+        // Forensic marker (presence is the signal; content is for audit only).
+        let marker = serde_json::json!({ "consumedAt": now, "keyRef": key_ref });
+        let blob = serde_json::to_vec(&marker)
+            .map_err(|e| TesseraError::Storage(format!("encode ledger marker: {e}")))?;
+        self.engine.put_if_absent(&path, blob).await
+    }
+
     /// Acquire (creating if absent) the per-path lock handle. The returned `Arc`
     /// guards a `tokio::sync::Mutex<()>` the caller `.lock().await`s around its RMW.
     fn path_lock(&self, path: &SecretPath) -> Arc<tokio::sync::Mutex<()>> {
@@ -482,6 +505,23 @@ mod tests {
             Arc::new(InMemoryAudit::new()),
             Arc::new(FixedClock("2026-06-14T00:00:00Z".into())),
         )
+    }
+
+    #[tokio::test]
+    async fn consume_nonce_first_true_replay_false_different_nonce_true() {
+        let s = store();
+        let key_ref = "tessera://transit/galvofs/cap";
+        // First use of (cap, n1) → true.
+        assert!(s.consume_nonce(key_ref, "n1").await.unwrap());
+        // Replay of (cap, n1) → false.
+        assert!(!s.consume_nonce(key_ref, "n1").await.unwrap());
+        // Different nonce (cap, n2) → true (not a false replay).
+        assert!(s.consume_nonce(key_ref, "n2").await.unwrap());
+        // Different keyRef, same nonce → true.
+        assert!(s
+            .consume_nonce("tessera://transit/galvofs/other", "n1")
+            .await
+            .unwrap());
     }
 
     #[tokio::test]

@@ -56,13 +56,30 @@ use crate::types::{SecretPath, TesseraError};
 /// The crypto provider this engine is pinned to (vanilla OpenSSL, never ShangMi).
 const CRYPTO_BACKEND: &str = "openssl";
 
+/// What one dispatched worker job does. `Run` is the existing single
+/// `handle_request`; `PutIfAbsent` is an atomic read-then-conditional-write
+/// executed entirely on the worker thread (so it is atomic w.r.t. all other
+/// jobs — never two `run()` awaits from the caller, which would race).
+enum JobKind {
+    Run {
+        op: Operation,
+        path: String,
+        body: Option<Map<String, Value>>,
+        reply: oneshot::Sender<Result<Option<Response>, TesseraError>>,
+    },
+    PutIfAbsent {
+        /// Logical path (already mount-prefixed via `logical_path`).
+        path: String,
+        /// The blob to insert if absent (already base64-wrapped body).
+        body: Map<String, Value>,
+        reply: oneshot::Sender<Result<bool, TesseraError>>,
+    },
+}
+
 /// One request dispatched to the dedicated `Core` worker thread.
 struct EngineJob {
     ctx: &'static str,
-    op: Operation,
-    path: String,
-    body: Option<Map<String, Value>>,
-    reply: oneshot::Sender<Result<Option<Response>, TesseraError>>,
+    kind: JobKind,
 }
 
 /// RustyVault-backed engine. The embedded `Core` is owned by a dedicated OS thread
@@ -112,10 +129,26 @@ impl RustyVaultEngine {
                     };
                     let (core, root_token) = core;
                     while let Some(job) = rx.recv().await {
-                        let mapped = handle_job(&core, &root_token, job.op, &job.path, job.body)
-                            .await
-                            .map_err(|e| store(format!("{}: {e}", job.ctx)));
-                        let _ = job.reply.send(mapped);
+                        let EngineJob { ctx, kind } = job;
+                        match kind {
+                            JobKind::Run {
+                                op,
+                                path,
+                                body,
+                                reply,
+                            } => {
+                                let mapped = handle_job(&core, &root_token, op, &path, body)
+                                    .await
+                                    .map_err(|e| store(format!("{ctx}: {e}")));
+                                let _ = reply.send(mapped);
+                            }
+                            JobKind::PutIfAbsent { path, body, reply } => {
+                                let res = put_if_absent_job(&core, &root_token, &path, body)
+                                    .await
+                                    .map_err(|e| store(format!("{ctx}: {e}")));
+                                let _ = reply.send(res);
+                            }
+                        }
                     }
                 });
             })
@@ -158,10 +191,12 @@ impl RustyVaultEngine {
         self.tx
             .send(EngineJob {
                 ctx,
-                op,
-                path: path.to_string(),
-                body,
-                reply,
+                kind: JobKind::Run {
+                    op,
+                    path: path.to_string(),
+                    body,
+                    reply,
+                },
             })
             .map_err(|_| store("engine worker thread is gone"))?;
         reply_rx
@@ -179,13 +214,26 @@ impl RustyVaultEngine {
         }
         let mut body = Map::new();
         body.insert("type".to_string(), Value::String("kv".to_string()));
-        self.run(
-            "mount",
-            Operation::Write,
-            &format!("sys/mounts/{mount}/"),
-            Some(body),
-        )
-        .await?;
+        match self
+            .run(
+                "mount",
+                Operation::Write,
+                &format!("sys/mounts/{mount}/"),
+                Some(body),
+            )
+            .await
+        {
+            Ok(_) => {}
+            // On reopen of an existing on-disk vault, a custom mount (e.g.
+            // `tessera-sys`) was already persisted but is absent from this fresh
+            // instance's in-memory `mounts` set, so RustyVault reports it already
+            // exists. That means the mount IS present — treat as success and cache
+            // it. (The default `secret` mount never hits this; only lazily-created
+            // mounts like the nonce ledger do, which is why restart-survival of the
+            // ledger exposed it.)
+            Err(TesseraError::Storage(msg)) if msg.contains("Mount path already exists") => {}
+            Err(e) => return Err(e),
+        }
         self.mounts
             .lock()
             .expect("mounts lock poisoned")
@@ -216,6 +264,29 @@ async fn handle_job(
     req.body = body;
     let guard = core.read().expect("core lock poisoned");
     guard.handle_request(&mut req).await
+}
+
+/// Atomic put-if-absent on the worker thread: one Read then a conditional
+/// Write, with no other job interleaving (single-threaded worker). Returns
+/// `true` if it wrote (was absent), `false` if a value already existed.
+async fn put_if_absent_job(
+    core: &Arc<RwLock<Core>>,
+    root_token: &str,
+    path: &str,
+    body: Map<String, Value>,
+) -> Result<bool, rusty_vault::errors::RvError> {
+    // Read current value.
+    let existing = handle_job(core, root_token, Operation::Read, path, None).await?;
+    let already = existing
+        .and_then(|r| r.data)
+        .and_then(|d| d.get("blob").cloned())
+        .is_some();
+    if already {
+        return Ok(false);
+    }
+    // Absent → write the marker body.
+    handle_job(core, root_token, Operation::Write, path, Some(body)).await?;
+    Ok(true)
 }
 
 /// Construct + config an embedded `Core`, then **init-if-empty, else unseal**,
@@ -440,6 +511,29 @@ impl SecretEngine for RustyVaultEngine {
         keys.dedup();
         Ok(keys)
     }
+
+    async fn put_if_absent(&self, path: &SecretPath, blob: Vec<u8>) -> Result<bool, TesseraError> {
+        self.ensure_mount(&path.mount).await?;
+        let mut body = Map::new();
+        body.insert(
+            "blob".to_string(),
+            Value::String(Base64::encode_string(&blob)),
+        );
+        let (reply, reply_rx) = oneshot::channel();
+        self.tx
+            .send(EngineJob {
+                ctx: "put_if_absent",
+                kind: JobKind::PutIfAbsent {
+                    path: Self::logical_path(path),
+                    body,
+                    reply,
+                },
+            })
+            .map_err(|_| store("engine worker thread is gone"))?;
+        reply_rx
+            .await
+            .map_err(|_| store("engine worker dropped the reply"))?
+    }
 }
 
 #[cfg(test)]
@@ -553,6 +647,34 @@ mod tests {
           // Re-open the SAME dir with the SAME master key: unseal path, not re-init.
         let eng2 = RustyVaultEngine::open(&dir, MK).await.unwrap();
         assert_eq!(eng2.get(&p).await.unwrap(), Some(b"persist-me".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn put_if_absent_first_true_replay_false() {
+        let eng = RustyVaultEngine::open(&temp_dir("pia"), MK).await.unwrap();
+        // Mount `tessera-sys` (NOT `sys`): RustyVault reserves `sys/` as a protected
+        // internal system backend — mounting a KV-v1 backend literally named `sys`
+        // errors with "Mount path is protected" (R3 collision confirmed live).
+        let p = SecretPath::new("tessera-sys", "a2e-nonce-ledger/abc");
+        assert!(eng.put_if_absent(&p, b"marker".to_vec()).await.unwrap());
+        assert!(!eng.put_if_absent(&p, b"marker2".to_vec()).await.unwrap());
+        // The consumed marker is still present.
+        assert_eq!(eng.get(&p).await.unwrap(), Some(b"marker".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn put_if_absent_survives_reopen_same_dir() {
+        // A replay after a process restart must still be rejected: the ledger
+        // entry persists across an engine drop+reopen against the same dir+key.
+        let dir = temp_dir("pia-restart");
+        let p = SecretPath::new("tessera-sys", "a2e-nonce-ledger/restart-1");
+        {
+            let eng = RustyVaultEngine::open(&dir, MK).await.unwrap();
+            assert!(eng.put_if_absent(&p, b"marker".to_vec()).await.unwrap());
+        } // engine dropped — simulates process exit
+        let eng2 = RustyVaultEngine::open(&dir, MK).await.unwrap();
+        // Second use AFTER restart sees the persisted entry → false (replay).
+        assert!(!eng2.put_if_absent(&p, b"marker".to_vec()).await.unwrap());
     }
 
     #[tokio::test]
