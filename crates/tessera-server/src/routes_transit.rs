@@ -90,6 +90,15 @@ fn mandate_err_response(err: &MandateError) -> (StatusCode, Json<Value>) {
     )
 }
 
+/// A2E replay rejection: the unwrap nonce was already consumed. 403 + the
+/// `replay-detected` code, matching the A2E error model (§3.6 / §4).
+fn replay_detected_response() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({ "errors": ["replay-detected: unwrap nonce already consumed"], "code": "replay-detected" })),
+    )
+}
+
 fn transit_scope() -> SecretPath {
     SecretPath::new("transit", "unwrap/galvofs")
 }
@@ -188,6 +197,43 @@ async fn unwrap_galvofs(
             return mandate_err_response(&e).into_response();
         }
     };
+
+    // One-time-use enforcement (trust-plane §4) — AFTER verify, BEFORE decrypt.
+    // Burn-on-failure: the nonce is consumed here, so a later decrypt failure
+    // cannot be retried to replay. Only engages on a VERIFIED mandate; the dev
+    // SkippedDev path (no mandate) is unchanged. Spec's replacement-ticket
+    // exception is out of scope — a burned nonce stays burned.
+    if let Some(c) = &claims {
+        // A verified mandate MUST carry a non-empty per-execution nonce.
+        if c.idempotency_key.is_empty() {
+            state
+                .vault
+                .record_action(AuditOp::TransitUnwrap, &scope, &token, false);
+            return bad_request("mandate-invalid: certifies.idempotencyKey is empty")
+                .into_response();
+        }
+        match state
+            .vault
+            .consume_nonce(&req.key_ref, &c.idempotency_key)
+            .await
+        {
+            Ok(true) => { /* first use — proceed */ }
+            Ok(false) => {
+                state
+                    .vault
+                    .record_action(AuditOp::TransitUnwrap, &scope, &token, false);
+                return replay_detected_response().into_response();
+            }
+            Err(e) => {
+                // Ledger failure is fail-closed: do not decrypt if we cannot
+                // record consumption (otherwise a replay could slip through).
+                state
+                    .vault
+                    .record_action(AuditOp::TransitUnwrap, &scope, &token, false);
+                return err_response(e).into_response();
+            }
+        }
+    }
 
     let ciphertext = match STANDARD.decode(&req.ciphertext_base64) {
         Ok(bytes) => bytes,
